@@ -38,7 +38,7 @@ namespace AmaanParkingSystem.Services
         private Timer _timer;
 
         // ── Runtime-configurable settings (in-memory, reset on restart) ─────
-        public bool IsEnabled { get; set; } = true;
+        public bool IsEnabled { get; set; } = false;
         public int ThresholdMinutes { get; set; } = 15;
         public int CooldownMinutes { get; set; } = 60;
         public int IntervalMinutes { get; set; } = 5;
@@ -138,7 +138,17 @@ namespace AmaanParkingSystem.Services
         // ─────────────────────────────────────────────────────────────────────
         // MAIN WORK
         // ─────────────────────────────────────────────────────────────────────
+        private readonly SemaphoreSlim _runLock = new SemaphoreSlim(1, 1);
+
         private async Task DoWorkAsync(object state)
+        {
+            // stops the timer and a manual run from overlapping and sending twice
+            if (!await _runLock.WaitAsync(0)) return;
+            try { await DoWorkCoreAsync(state); }
+            finally { _runLock.Release(); }
+        }
+
+        private async Task DoWorkCoreAsync(object state)
         {
             LastRunTime = DateTime.Now;
             NextRunTime = DateTime.Now.AddMinutes(TRIAL_MODE ? 1 : IntervalMinutes);
@@ -214,7 +224,7 @@ namespace AmaanParkingSystem.Services
                         continue;
                     }
 
-                    string subject = $"🅿️ Action Required: Please Move Your Vehicle to B2 Parking – {car.car_plate_no ?? car.cardno}";
+                    string subject = $"🅿️ Action Required: Move Your Vehicle to B2 Parking or Visitor Rates Will Apply – {car.car_plate_no ?? car.cardno}";
                     string body = BuildEmailBody(subCo, new System.Collections.Generic.List<B2PendingEntry> { car });
 
                     bool ok = await SendEmailAsync(smtp, subCo.Email, subject, body);
@@ -268,6 +278,11 @@ namespace AmaanParkingSystem.Services
                     FROM dbo.db_tbl_28_B2Notificationlog
                     WHERE EntryId = @EntryId
                     ORDER BY NotificationTime DESC;";
+
+                var alreadySent = await conn.ExecuteScalarAsync<int>(
+                    "SELECT COUNT(1) FROM dbo.db_tbl_28_B2Notificationlog WHERE EntryId = @EntryId AND Status = 'Email Sent'",
+                    new { EntryId = entryId });
+                if (alreadySent > 0) return true; // one email per entry, never repeat
 
                 var last = await conn.QueryFirstOrDefaultAsync<DateTime?>(sql, new { EntryId = entryId });
                 if (last == null) return false;
@@ -580,7 +595,9 @@ namespace AmaanParkingSystem.Services
         <strong>⚠️ Action Required:</strong> The following vehicle(s) under your company
         (<strong>{subCo.SubCoName}</strong>) have been parked for more than
         <strong>{ThresholdMinutes} minutes</strong> without proceeding to <strong>B2 Parking</strong>.
-        Please ensure they are moved to B2 immediately.
+        Please move them to B2 immediately.<br><br>
+        <strong>Important:</strong> If the vehicle is not moved to B2 Parking within the given time,
+        it will be charged at <strong>Visitor rates</strong>.
       </div>
       <table>
         <thead>
