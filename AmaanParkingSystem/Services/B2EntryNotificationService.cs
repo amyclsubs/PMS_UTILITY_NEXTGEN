@@ -596,8 +596,10 @@ namespace AmaanParkingSystem.Services
         (<strong>{subCo.SubCoName}</strong>) have been parked for more than
         <strong>{ThresholdMinutes} minutes</strong> without proceeding to <strong>B2 Parking</strong>.
         Please move them to B2 immediately.<br><br>
-        <strong>Important:</strong> If the vehicle is not moved to B2 Parking within the given time,
-        it will be charged at <strong>Visitor rates</strong>.
+        <strong style=""color: red;"">
+    Important: If the vehicle is not moved to B2 Parking within the given time,
+    it will be charged at Visitor rates on top of your daily charges.
+        </strong>
       </div>
       <table>
         <thead>
