@@ -478,8 +478,126 @@ namespace AmaanParkingSystem.Controllers
             }
         }
 
-        // ===== M-PESA STK PUSH METHODS =====
+        // ===== TRANSFER BALANCE BETWEEN SUB COMPANIES =====
 
+        [HttpPost]
+        public async Task<IActionResult> TransferCompanyBalance([FromBody] CompanyBalanceTransferRequest request)
+        {
+            try
+            {
+                if (request == null || string.IsNullOrWhiteSpace(request.FromSubCompanyId) || string.IsNullOrWhiteSpace(request.ToSubCompanyId))
+                    return Json(new { success = false, message = "Please select both companies" });
+
+                if (request.FromSubCompanyId == request.ToSubCompanyId)
+                    return Json(new { success = false, message = "Source and destination company cannot be the same" });
+
+                if (request.Amount <= 0)
+                    return Json(new { success = false, message = "Please enter a valid transfer amount" });
+
+                using var conn = new SqlConnection(GetDynamicConnectionString());
+                await conn.OpenAsync();
+                using var tran = conn.BeginTransaction();
+
+                string balSql = @"
+            SELECT 
+                car_parkers_sub_co_name AS CompanyName,
+                CAST(ISNULL(Balance_Amount, 0) AS DECIMAL(18,2)) AS Balance
+            FROM [AMAAN_PMS].[dbo].[db_tbl_08_parkers_company] WITH (UPDLOCK, ROWLOCK)
+            WHERE car_parkers_sub_co_id = @SubCoId";
+
+                var src = await conn.QueryFirstOrDefaultAsync<dynamic>(balSql, new { SubCoId = request.FromSubCompanyId }, tran);
+                if (src == null)
+                    return Json(new { success = false, message = "Source company not found" });
+
+                var dst = await conn.QueryFirstOrDefaultAsync<dynamic>(balSql, new { SubCoId = request.ToSubCompanyId }, tran);
+                if (dst == null)
+                    return Json(new { success = false, message = "Destination company not found" });
+
+                decimal srcBalance = (decimal)src.Balance;
+                string srcName = (string)src.CompanyName;
+                string dstName = (string)dst.CompanyName;
+
+                if (srcBalance < request.Amount)
+                    return Json(new { success = false, message = $"Insufficient balance. Available balance: KES {srcBalance:N2}" });
+
+
+                var rnd = new Random();
+                string stamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+                string outId = $"TRO_{stamp}_{rnd.Next(1000, 9999)}";
+                string inId = $"TRI_{stamp}_{rnd.Next(1000, 9999)}";
+
+                string insertSql = @"
+            INSERT INTO [AMAAN_PMS].[dbo].[db_tbl_19_transactions]
+            (
+                transaction_id,
+                transaction_type,
+                paidamount,
+                operator_name,
+                transaction_status,
+                payment_source,
+                status,
+                created_by,
+                created_on,
+                Remark,
+                car_parkers_sub_co_id,
+                car_parkers_sub_co_name
+            )
+            VALUES
+            (
+                @TransactionId,
+                @TransactionType,
+                @PaidAmount,
+                @OperatorName,
+                'Completed',
+                @PaymentSource,
+                '1',
+                @CreatedBy,
+                GETDATE(),
+                @Remark,
+                @SubCompanyId,
+                @SubCompanyName
+            )";
+
+                string userRemark = string.IsNullOrWhiteSpace(request.Remark) ? "" : " | " + request.Remark;
+
+                await conn.ExecuteAsync(insertSql, new
+                {
+                    TransactionId = outId,
+                    TransactionType = "TOP-UP",
+                    PaidAmount = -request.Amount,
+                    OperatorName = request.OperatorName ?? "System",
+                    PaymentSource = "Server(Transfer Out)",
+                    CreatedBy = request.CreatedBy ?? "Admin",
+                    Remark = $"Transferred to {dstName} ({request.ToSubCompanyId}){userRemark}",
+                    SubCompanyId = request.FromSubCompanyId,
+                    SubCompanyName = srcName
+                }, tran);
+
+                await conn.ExecuteAsync(insertSql, new
+                {
+                    TransactionId = inId,
+                    TransactionType = "TOP-UP",
+                    PaidAmount = request.Amount,
+                    OperatorName = request.OperatorName ?? "System",
+                    PaymentSource = "Server(Transfer In)",
+                    CreatedBy = request.CreatedBy ?? "Admin",
+                    Remark = $"Received from {srcName} ({request.FromSubCompanyId}){userRemark}",
+                    SubCompanyId = request.ToSubCompanyId,
+                    SubCompanyName = dstName
+                }, tran);
+
+                tran.Commit();
+
+                return Json(new { success = true, message = "Balance transferred successfully", transactionId = outId });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error transferring company balance");
+                return Json(new { success = false, message = ex.Message });
+            }
+        }
+
+        // ===== M-PESA STK PUSH METHODS =====
         [HttpPost]
         public async Task<IActionResult> InitiateMpesaTopUp([FromBody] MpesaTopUpRequest request)
         {
@@ -646,6 +764,15 @@ namespace AmaanParkingSystem.Controllers
 
         // ===== REQUEST/RESPONSE CLASSES =====
 
+        public class CompanyBalanceTransferRequest
+        {
+            public string FromSubCompanyId { get; set; }
+            public string ToSubCompanyId { get; set; }
+            public decimal Amount { get; set; }
+            public string Remark { get; set; }
+            public string OperatorName { get; set; }
+            public string CreatedBy { get; set; }
+        }
         public class CompanyTopUpRequest
         {
             public string SubCompanyId { get; set; }

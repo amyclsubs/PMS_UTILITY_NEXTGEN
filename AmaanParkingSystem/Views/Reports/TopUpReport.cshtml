@@ -210,7 +210,9 @@
                             <button class="btn btn-warning" onclick="openWaiverModal()">
                                 <i class="fas fa-hand-holding-usd"></i> Add Waiver/Discount
                             </button>
-                        </div>
+                            <button class="btn btn-info text-white" onclick="openTransferModal()">
+                                <i class="fas fa-exchange-alt"></i> Transfer Balance
+                            </button>                        </div>
                     </div>
 
                     <div class="row mt-3">
@@ -350,6 +352,80 @@
         </div>
     </div>
 </div>
+<!-- Transfer Balance Modal -->
+<div class="modal fade" id="transferModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-info text-white">
+                <h5 class="modal-title"><i class="fas fa-exchange-alt"></i> Transfer Balance Between Companies</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="transferForm" onsubmit="return false;">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6 class="text-danger"><i class="fas fa-arrow-up"></i> FROM (Source)</h6>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>COMPANY NAME</strong></label>
+                                <select id="trf_fromCompanyId" class="form-select" onchange="loadTransferCompanyDetails('from')">
+                                    <option value="">-- Select Company --</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>AVAILABLE BALANCE</strong></label>
+                                <input type="text" id="trf_fromBalance" class="form-control" readonly />
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>BALANCE AFTER TRANSFER</strong></label>
+                                <input type="text" id="trf_fromAfter" class="form-control bg-light" readonly />
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <h6 class="text-success"><i class="fas fa-arrow-down"></i> TO (Destination)</h6>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>COMPANY NAME</strong></label>
+                                <select id="trf_toCompanyId" class="form-select" onchange="loadTransferCompanyDetails('to')">
+                                    <option value="">-- Select Company --</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>CURRENT BALANCE</strong></label>
+                                <input type="text" id="trf_toBalance" class="form-control" readonly />
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label"><strong>BALANCE AFTER TRANSFER</strong></label>
+                                <input type="text" id="trf_toAfter" class="form-control bg-light" readonly />
+                            </div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label"><strong>TRANSFER AMOUNT</strong><span class="text-danger">*</span></label>
+                                <input type="number" id="trf_amount" class="form-control" placeholder="Enter amount" min="1" step="0.01" oninput="calculateTransferBalances()" />
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label"><strong>REMARK</strong></label>
+                                <input type="text" id="trf_remark" class="form-control" placeholder="Enter remark" />
+                            </div>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-success" id="trf_confirmBtn" onclick="confirmTransfer()">
+                    <i class="fas fa-check"></i> Transfer
+                </button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="fas fa-times"></i> Cancel
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- TOP-UP Confirmation Modal -->
 <div class="modal fade" id="topupConfirmModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog">
@@ -1447,6 +1523,155 @@
             } catch (error) {
                 console.error('Error:', error);
                 showMessage('Error: ' + error.message, 'danger');
+            }
+        }
+
+         // ===== TRANSFER BALANCE FUNCTIONS =====
+        let transferBalances = { from: 0, to: 0 };
+
+        async function openTransferModal() {
+            document.getElementById('transferForm').reset();
+            transferBalances = { from: 0, to: 0 };
+            clearTransferSide('from');
+            clearTransferSide('to');
+            await loadCompaniesForTransfer();
+
+            var modal = new bootstrap.Modal(document.getElementById('transferModal'));
+            modal.show();
+        }
+
+        async function loadCompaniesForTransfer() {
+            try {
+                const response = await fetch('/TopUpReport/GetSubCompanies');
+                const result = await response.json();
+
+                if (result.success) {
+                    ['trf_fromCompanyId', 'trf_toCompanyId'].forEach(function (selectId) {
+                        const select = document.getElementById(selectId);
+                        select.innerHTML = '<option value="">-- Select Company --</option>';
+
+                        result.data.forEach(company => {
+                            const option = document.createElement('option');
+                            option.value = company.car_parkers_sub_co_id;
+                            option.textContent = company.car_parkers_sub_co_name;
+                            select.appendChild(option);
+                        });
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading companies for transfer:', error);
+            }
+        }
+
+        function clearTransferSide(side) {
+            const prefix = side === 'from' ? 'trf_from' : 'trf_to';
+            document.getElementById(prefix + 'Balance').value = '';
+            document.getElementById(prefix + 'After').value = '';
+        }
+
+        async function loadTransferCompanyDetails(side) {
+            const selectId = side === 'from' ? 'trf_fromCompanyId' : 'trf_toCompanyId';
+            const prefix = side === 'from' ? 'trf_from' : 'trf_to';
+            const subCoId = document.getElementById(selectId).value;
+
+            if (!subCoId) {
+                transferBalances[side] = 0;
+                clearTransferSide(side);
+                calculateTransferBalances();
+                return;
+            }
+
+            try {
+                const response = await fetch(`/TopUpReport/GetCompanyDetailsForWaiver?subCoId=${encodeURIComponent(subCoId)}`);
+                const result = await response.json();
+
+                if (result.success && result.data) {
+                    const bal = parseFloat(String(result.data.Balance_Amount || 0).replace(/,/g, '')) || 0;
+                    transferBalances[side] = bal;
+                    document.getElementById(prefix + 'Balance').value = 'KES ' + bal.toFixed(2);
+                    calculateTransferBalances();
+                } else {
+                    showMessage(result.message || 'Company not found', 'warning');
+                }
+            } catch (error) {
+                console.error('Error loading company details for transfer:', error);
+                showMessage('Error loading company details', 'danger');
+            }
+        }
+
+        function calculateTransferBalances() {
+            const amount = parseFloat(document.getElementById('trf_amount').value) || 0;
+
+            if (document.getElementById('trf_fromCompanyId').value) {
+                document.getElementById('trf_fromAfter').value = 'KES ' + (transferBalances.from - amount).toFixed(2);
+            }
+            if (document.getElementById('trf_toCompanyId').value) {
+                document.getElementById('trf_toAfter').value = 'KES ' + (transferBalances.to + amount).toFixed(2);
+            }
+        }
+
+        async function confirmTransfer() {
+            const fromId = document.getElementById('trf_fromCompanyId').value;
+            const toId = document.getElementById('trf_toCompanyId').value;
+            const amount = parseFloat(document.getElementById('trf_amount').value);
+            const remark = document.getElementById('trf_remark').value;
+
+            if (!fromId || !toId) {
+                showMessage('Please select both source and destination companies', 'warning');
+                return;
+            }
+
+            if (fromId === toId) {
+                showMessage('Source and destination company cannot be the same', 'warning');
+                return;
+            }
+
+            if (!amount || amount <= 0) {
+                showMessage('Please enter a valid transfer amount', 'warning');
+                return;
+            }
+
+            if (amount > transferBalances.from) {
+                showMessage('Insufficient balance. Available balance: KES ' + transferBalances.from.toFixed(2), 'danger');
+                return;
+            }
+
+            const btn = document.getElementById('trf_confirmBtn');
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/TopUpReport/TransferCompanyBalance', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fromSubCompanyId: fromId,
+                        toSubCompanyId: toId,
+                        amount: amount,
+                        remark: remark,
+                        operatorName: 'System',
+                        createdBy: 'Admin'
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    var modal = bootstrap.Modal.getInstance(document.getElementById('transferModal'));
+                    if (modal) modal.hide();
+
+                    showMessage('Balance transferred successfully! ID: ' + result.transactionId, 'success');
+
+                    if (document.getElementById('startDateHidden').value) {
+                        loadTopUpReport();
+                    }
+                } else {
+                    showMessage(result.message || 'Error transferring balance', 'danger');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showMessage('Error: ' + error.message, 'danger');
+            } finally {
+                btn.disabled = false;
             }
         }
 
