@@ -1762,6 +1762,918 @@ namespace AmaanParkingSystem.Controllers
             return File(stream.ToArray(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fileName);
         }
 
+        // ============================================
+        // HOURLY COLLECTION REPORT (NEW)
+        // ============================================
+        public class HourlyFilterRequest
+        {
+            public DateTime Date { get; set; }
+        }
+
+        public class HourlyRow
+        {
+            public int hour { get; set; }
+            public string label { get; set; }
+            public int count { get; set; }
+            public int cashCount { get; set; }
+            public decimal cashAmount { get; set; }
+            public int mpesaCount { get; set; }
+            public decimal mpesaAmount { get; set; }
+            public int paybillCount { get; set; }
+            public decimal paybillAmount { get; set; }
+            public int focCount { get; set; }
+            public decimal focAmount { get; set; }
+            public int otherCount { get; set; }
+            public decimal otherAmount { get; set; }
+            public decimal totalCharges { get; set; }
+            public decimal discount { get; set; }
+            public decimal totalPaid { get; set; }
+            public Dictionary<string, int> deviceCount { get; set; } = new Dictionary<string, int>();
+            public Dictionary<string, decimal> deviceAmount { get; set; } = new Dictionary<string, decimal>();
+        }
+
+        public class HourlyTxn
+        {
+            public string hourLabel { get; set; }
+            public string transactionId { get; set; }
+            public string cardNo { get; set; }
+            public string cardName { get; set; }
+            public string entryTime { get; set; }
+            public string exitTime { get; set; }
+            public string parkTime { get; set; }
+            public decimal charge { get; set; }
+            public decimal paid { get; set; }
+            public decimal discount { get; set; }
+            public string payMode { get; set; }
+            public string paySource { get; set; }
+        }
+
+        private static readonly string[] HourlyDevices = new[]
+        {
+            "Server", "Paystation1", "Paystation2", "Paystation3", "Paystation4",
+            "HHD1", "HHD2", "HHD3", "HHD4", "Web"
+        };
+
+        private static string HourlyDeviceKey(string src)
+        {
+            if (string.IsNullOrWhiteSpace(src)) return "Server";
+            string n = src.Trim().ToUpperInvariant().Replace(" ", "").Replace("-", "").Replace("_", "");
+            foreach (var d in HourlyDevices)
+            {
+                if (n.Contains(d.ToUpperInvariant())) return d;
+            }
+            return "Server";
+        }
+
+        private async Task<(List<HourlyRow> rows, List<HourlyTxn> txns)> BuildHourlyReport(DateTime date)
+        {
+            var data = await _collectionService.GetDailyCollectionData(date, date);
+
+            var rows = new List<HourlyRow>();
+            for (int h = 0; h < 24; h++)
+            {
+                var r = new HourlyRow { hour = h, label = $"{h:D2}:00 - {h:D2}:59" };
+                foreach (var d in HourlyDevices)
+                {
+                    r.deviceCount[d] = 0;
+                    r.deviceAmount[d] = 0m;
+                }
+                rows.Add(r);
+            }
+
+            var txns = new List<HourlyTxn>();
+
+            foreach (var rec in data)
+            {
+                if (!rec.exit_time.HasValue) continue;
+
+                int hour = rec.exit_time.Value.Hour;
+                var row = rows[hour];
+
+                decimal charge = rec.charges ?? 0m;
+                decimal paid = rec.paid_amount ?? 0m;
+                decimal disc = (decimal)(rec.discount_amount ?? 0m);
+                string payMode = NormalizePayModeLocal(rec.pay_mode);
+                string device = HourlyDeviceKey(rec.pay_source);
+
+                row.count++;
+                row.totalCharges += charge;
+                row.discount += disc;
+                row.totalPaid += paid;
+                row.deviceCount[device]++;
+                row.deviceAmount[device] += paid;
+
+                if (payMode == "Cash") { row.cashCount++; row.cashAmount += paid; }
+                else if (payMode == "M-Pesa") { row.mpesaCount++; row.mpesaAmount += paid; }
+                else if (payMode == "M-Pesa Via Paybill") { row.paybillCount++; row.paybillAmount += paid; }
+                else if (payMode == "Free of Charge") { row.focCount++; row.focAmount += charge; }
+                else { row.otherCount++; row.otherAmount += paid; }
+
+                string parkTime = "N/A";
+                if (rec.park_time_total.HasValue && rec.park_time_total.Value > 0)
+                {
+                    int hrs = rec.park_time_total.Value / 60;
+                    int mins = rec.park_time_total.Value % 60;
+                    parkTime = $"{hrs}h {mins}m";
+                }
+
+                txns.Add(new HourlyTxn
+                {
+                    hourLabel = row.label,
+                    transactionId = rec.transaction_id,
+                    cardNo = rec.cardno,
+                    cardName = rec.card_name,
+                    entryTime = rec.entry_time.HasValue ? rec.entry_time.Value.ToString("dd-MMM-yyyy HH:mm:ss").ToUpper() : "--",
+                    exitTime = rec.exit_time.Value.ToString("dd-MMM-yyyy HH:mm:ss").ToUpper(),
+                    parkTime = parkTime,
+                    charge = charge,
+                    paid = paid,
+                    discount = disc,
+                    payMode = rec.pay_mode,
+                    paySource = rec.pay_source
+                });
+            }
+
+            txns = txns.OrderBy(t => t.exitTime == null ? DateTime.MinValue : DateTime.ParseExact(t.exitTime, "dd-MMM-yyyy HH:mm:ss", CultureInfo.InvariantCulture)).ToList();
+            return (rows, txns);
+        }
+
+        public IActionResult Hourly()
+        {
+            return View();
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> GetHourlyData([FromBody] HourlyFilterRequest request)
+        {
+            try
+            {
+                var (rows, txns) = await BuildHourlyReport(request.Date.Date);
+                return Json(new
+                {
+                    success = true,
+                    hours = rows,
+                    transactions = txns,
+                    recordCount = txns.Count
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in GetHourlyData: {ex.Message}\n{ex.StackTrace}");
+                return Json(new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> ExportHourlyExcel(string date)
+        {
+            try
+            {
+                if (!DateTime.TryParse(date, out var d))
+                    return BadRequest("Invalid date format");
+
+                var (rows, txns) = await BuildHourlyReport(d.Date);
+
+                using var workbook = new XLWorkbook();
+
+                // ---------- Sheet 1: Hourly Summary ----------
+                var ws = workbook.Worksheets.Add("Hourly Summary");
+                string[] headers = {
+                    "Hour", "Vehicles", "Cash Count", "Cash (KES)", "M-Pesa Count", "M-Pesa (KES)",
+                    "Paybill Count", "Paybill (KES)", "FOC Count", "FOC Amount (KES)",
+                    "Other Count", "Other (KES)", "Total Charges (KES)", "Discount (KES)", "Total Paid (KES)"
+                };
+                for (int c = 0; c < headers.Length; c++)
+                    ws.Cell(1, c + 1).Value = headers[c];
+
+                var hdr = ws.Range(1, 1, 1, headers.Length);
+                hdr.Style.Font.Bold = true;
+                hdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                hdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                hdr.Style.Alignment.WrapText = true;
+                ws.SheetView.FreezeRows(1);
+
+                int r = 2;
+                foreach (var h in rows)
+                {
+                    object[] vals = {
+                        h.label, h.count, h.cashCount, h.cashAmount, h.mpesaCount, h.mpesaAmount,
+                        h.paybillCount, h.paybillAmount, h.focCount, h.focAmount,
+                        h.otherCount, h.otherAmount, h.totalCharges, h.discount, h.totalPaid
+                    };
+                    for (int c = 0; c < vals.Length; c++)
+                        ws.Cell(r, c + 1).Value = XLCellValue.FromObject(vals[c]);
+                    r++;
+                }
+
+                ws.Cell(r, 1).Value = "TOTAL";
+                for (int c = 2; c <= headers.Length; c++)
+                {
+                    string col = ws.Cell(2, c).Address.ColumnLetter;
+                    ws.Cell(r, c).FormulaA1 = $"=SUM({col}2:{col}{r - 1})";
+                }
+                var totalRange = ws.Range(r, 1, r, headers.Length);
+                totalRange.Style.Font.Bold = true;
+                totalRange.Style.Fill.BackgroundColor = XLColor.Gold;
+
+                foreach (var c in new[] { 4, 6, 8, 10, 12, 13, 14, 15 })
+                    ws.Range(2, c, r, c).Style.NumberFormat.Format = "#,##0.00";
+
+                ws.Range(1, 1, r, headers.Length).Style.Border.OutsideBorder = XLBorderStyleValues.Thick;
+                ws.Range(1, 1, r, headers.Length).Style.Border.InsideBorder = XLBorderStyleValues.Thin;
+                ws.Column(1).Width = 16;
+                for (int c = 2; c <= headers.Length; c++) ws.Column(c).Width = 13;
+                ws.Row(1).Height = 32;
+
+                // ---------- Sheet 2: Payment Source Summary ----------
+                var ds = workbook.Worksheets.Add("Payment Source Summary");
+                ds.Cell(1, 1).Value = "Hour";
+                ds.Range(1, 1, 2, 1).Merge();
+                int col2 = 2;
+                foreach (var dev in HourlyDevices)
+                {
+                    ds.Cell(1, col2).Value = dev;
+                    ds.Range(1, col2, 1, col2 + 1).Merge();
+                    ds.Cell(2, col2).Value = "Count";
+                    ds.Cell(2, col2 + 1).Value = "Amount (KES)";
+                    col2 += 2;
+                }
+                ds.Cell(1, col2).Value = "Total";
+                ds.Range(1, col2, 1, col2 + 1).Merge();
+                ds.Cell(2, col2).Value = "Count";
+                ds.Cell(2, col2 + 1).Value = "Amount (KES)";
+                int lastCol = col2 + 1;
+
+                var dsHdr = ds.Range(1, 1, 2, lastCol);
+                dsHdr.Style.Font.Bold = true;
+                dsHdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                dsHdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                dsHdr.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
+                ds.SheetView.FreezeRows(2);
+
+                int dr = 3;
+                foreach (var h in rows)
+                {
+                    ds.Cell(dr, 1).Value = h.label;
+                    int cc = 2;
+                    foreach (var dev in HourlyDevices)
+                    {
+                        ds.Cell(dr, cc).Value = h.deviceCount[dev];
+                        ds.Cell(dr, cc + 1).Value = h.deviceAmount[dev];
+                        ds.Cell(dr, cc + 1).Style.NumberFormat.Format = "#,##0.00";
+                        cc += 2;
+                    }
+                    ds.Cell(dr, cc).Value = h.count;
+                    ds.Cell(dr, cc + 1).Value = h.totalPaid;
+                    ds.Cell(dr, cc + 1).Style.NumberFormat.Format = "#,##0.00";
+                    dr++;
+                }
+
+                ds.Cell(dr, 1).Value = "TOTAL";
+                for (int c = 2; c <= lastCol; c++)
+                {
+                    string col = ds.Cell(3, c).Address.ColumnLetter;
+                    ds.Cell(dr, c).FormulaA1 = $"=SUM({col}3:{col}{dr - 1})";
+                    if (c % 2 == 1) ds.Cell(dr, c).Style.NumberFormat.Format = "#,##0.00";
+                }
+                var dsTotal = ds.Range(dr, 1, dr, lastCol);
+                dsTotal.Style.Font.Bold = true;
+                dsTotal.Style.Fill.BackgroundColor = XLColor.Gold;
+                ds.Range(1, 1, dr, lastCol).Style.Border.OutsideBorder = XLBorderStyleValues.Thick;
+                ds.Range(1, 1, dr, lastCol).Style.Border.InsideBorder = XLBorderStyleValues.Thin;
+                ds.Column(1).Width = 16;
+                for (int c = 2; c <= lastCol; c++) ds.Column(c).Width = 13;
+
+                // ---------- Sheet 3: Transactions ----------
+                var ts = workbook.Worksheets.Add("Transactions");
+                string[] th = {
+                    "#", "Hour", "Transaction ID", "Card Number", "Card Name", "Entry Time", "Exit Time",
+                    "Park Time", "Charge (KES)", "Paid (KES)", "Discount (KES)", "Pay Mode", "Payment Source"
+                };
+                for (int c = 0; c < th.Length; c++)
+                    ts.Cell(1, c + 1).Value = th[c];
+                var tsHdr = ts.Range(1, 1, 1, th.Length);
+                tsHdr.Style.Font.Bold = true;
+                tsHdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                tsHdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                ts.SheetView.FreezeRows(1);
+
+                int tr = 2;
+                int no = 1;
+                foreach (var t in txns)
+                {
+                    ts.Cell(tr, 1).Value = no++;
+                    ts.Cell(tr, 2).Value = t.hourLabel ?? "";
+                    ts.Cell(tr, 3).Value = t.transactionId ?? "";
+                    ts.Cell(tr, 4).Value = t.cardNo ?? "";
+                    ts.Cell(tr, 5).Value = t.cardName ?? "";
+                    ts.Cell(tr, 6).Value = t.entryTime ?? "";
+                    ts.Cell(tr, 7).Value = t.exitTime ?? "";
+                    ts.Cell(tr, 8).Value = t.parkTime ?? "";
+                    ts.Cell(tr, 9).Value = t.charge;
+                    ts.Cell(tr, 10).Value = t.paid;
+                    ts.Cell(tr, 11).Value = t.discount;
+                    ts.Cell(tr, 12).Value = t.payMode ?? "";
+                    ts.Cell(tr, 13).Value = t.paySource ?? "";
+                    ts.Range(tr, 9, tr, 11).Style.NumberFormat.Format = "#,##0.00";
+                    tr++;
+                }
+                ts.Columns().AdjustToContents();
+
+                using var stream = new MemoryStream();
+                workbook.SaveAs(stream);
+                stream.Position = 0;
+                var fileName = $"HOURLY_REPORT_{d:dd-MMM-yyyy}_{DateTime.Now:HH-mm-ss}.xlsx";
+                return File(stream.ToArray(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    fileName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in ExportHourlyExcel: {ex.Message}\n{ex.StackTrace}");
+                return BadRequest($"Error: {ex.Message}");
+            }
+        }
+
+        // ============================================
+        // HOURLY COLLECTION: TRANSACTIONS TAB (NEW)
+        // ============================================
+        public class HourlyTransTxn
+        {
+            public string hourLabel { get; set; }
+            public string transactionId { get; set; }
+            public string cardNo { get; set; }
+            public string cardName { get; set; }
+            public string entryTime { get; set; }
+            public string validationTime { get; set; }
+            public decimal amount { get; set; }
+            public string payMode { get; set; }
+            public string paySource { get; set; }
+            public string status { get; set; }
+        }
+
+        private async Task<(List<HourlyRow> rows, List<HourlyTransTxn> txns)> BuildHourlyTransactionReport(DateTime date)
+        {
+            var data = await _collectionService.GetTransactionSummary(date, date);
+
+            var rows = new List<HourlyRow>();
+            for (int h = 0; h < 24; h++)
+            {
+                var r = new HourlyRow { hour = h, label = $"{h:D2}:00 - {h:D2}:59" };
+                foreach (var d in HourlyDevices)
+                {
+                    r.deviceCount[d] = 0;
+                    r.deviceAmount[d] = 0m;
+                }
+                rows.Add(r);
+            }
+
+            var list = new List<(DateTime when, HourlyTransTxn txn)>();
+
+            foreach (var rec in data)
+            {
+                DateTime when;
+                if (rec.validation_time.HasValue) when = rec.validation_time.Value;
+                else if (rec.revalidation_time.HasValue) when = rec.revalidation_time.Value;
+                else continue;
+
+                var row = rows[when.Hour];
+
+                string rawMode = !string.IsNullOrWhiteSpace(rec.validation_paymode)
+                    ? rec.validation_paymode
+                    : rec.revalidation_paymode;
+
+                decimal amount = rec.paidamount ?? 0m;
+                string device = HourlyDeviceKey(rec.payment_source);
+
+                row.count++;
+                row.totalPaid += amount;
+                row.deviceCount[device]++;
+                row.deviceAmount[device] += amount;
+
+                string payMode = string.IsNullOrWhiteSpace(rawMode) ? "Other" : NormalizePayModeLocal(rawMode);
+                if (payMode == "Cash") { row.cashCount++; row.cashAmount += amount; }
+                else if (payMode == "M-Pesa") { row.mpesaCount++; row.mpesaAmount += amount; }
+                else if (payMode == "M-Pesa Via Paybill") { row.paybillCount++; row.paybillAmount += amount; }
+                else if (payMode == "Free of Charge") { row.focCount++; row.focAmount += amount; }
+                else { row.otherCount++; row.otherAmount += amount; }
+
+                list.Add((when, new HourlyTransTxn
+                {
+                    hourLabel = row.label,
+                    transactionId = rec.transaction_id,
+                    cardNo = rec.cardno,
+                    cardName = rec.cardname,
+                    entryTime = rec.entry_time.HasValue ? rec.entry_time.Value.ToString("dd-MMM-yyyy HH:mm:ss").ToUpper() : "--",
+                    validationTime = when.ToString("dd-MMM-yyyy HH:mm:ss").ToUpper(),
+                    amount = amount,
+                    payMode = string.IsNullOrWhiteSpace(rawMode) ? "N/A" : rawMode,
+                    paySource = rec.payment_source,
+                    status = rec.status?.ToString()
+                }));
+            }
+
+            var txns = list.OrderBy(x => x.when).Select(x => x.txn).ToList();
+            return (rows, txns);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> GetHourlyTransactionData([FromBody] HourlyFilterRequest request)
+        {
+            try
+            {
+                var (rows, txns) = await BuildHourlyTransactionReport(request.Date.Date);
+                return Json(new
+                {
+                    success = true,
+                    hours = rows,
+                    transactions = txns,
+                    recordCount = txns.Count
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in GetHourlyTransactionData: {ex.Message}\n{ex.StackTrace}");
+                return Json(new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> ExportHourlyTransactionExcel(string date)
+        {
+            try
+            {
+                if (!DateTime.TryParse(date, out var d))
+                    return BadRequest("Invalid date format");
+
+                var (rows, txns) = await BuildHourlyTransactionReport(d.Date);
+
+                using var workbook = new XLWorkbook();
+
+                // ---------- Sheet 1: Hourly Summary ----------
+                var ws = workbook.Worksheets.Add("Hourly Summary");
+                string[] headers = {
+                    "Hour", "Transactions", "Cash Count", "Cash (KES)", "M-Pesa Count", "M-Pesa (KES)",
+                    "Paybill Count", "Paybill (KES)", "FOC Count", "FOC Amount (KES)",
+                    "Other Count", "Other (KES)", "Total Paid (KES)"
+                };
+                for (int c = 0; c < headers.Length; c++)
+                    ws.Cell(1, c + 1).Value = headers[c];
+
+                var hdr = ws.Range(1, 1, 1, headers.Length);
+                hdr.Style.Font.Bold = true;
+                hdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                hdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                hdr.Style.Alignment.WrapText = true;
+                ws.SheetView.FreezeRows(1);
+
+                int r = 2;
+                foreach (var h in rows)
+                {
+                    object[] vals = {
+                        h.label, h.count, h.cashCount, h.cashAmount, h.mpesaCount, h.mpesaAmount,
+                        h.paybillCount, h.paybillAmount, h.focCount, h.focAmount,
+                        h.otherCount, h.otherAmount, h.totalPaid
+                    };
+                    for (int c = 0; c < vals.Length; c++)
+                        ws.Cell(r, c + 1).Value = XLCellValue.FromObject(vals[c]);
+                    r++;
+                }
+
+                ws.Cell(r, 1).Value = "TOTAL";
+                for (int c = 2; c <= headers.Length; c++)
+                {
+                    string col = ws.Cell(2, c).Address.ColumnLetter;
+                    ws.Cell(r, c).FormulaA1 = $"=SUM({col}2:{col}{r - 1})";
+                }
+                var totalRange = ws.Range(r, 1, r, headers.Length);
+                totalRange.Style.Font.Bold = true;
+                totalRange.Style.Fill.BackgroundColor = XLColor.Gold;
+
+                foreach (var c in new[] { 4, 6, 8, 10, 12, 13 })
+                    ws.Range(2, c, r, c).Style.NumberFormat.Format = "#,##0.00";
+
+                ws.Range(1, 1, r, headers.Length).Style.Border.OutsideBorder = XLBorderStyleValues.Thick;
+                ws.Range(1, 1, r, headers.Length).Style.Border.InsideBorder = XLBorderStyleValues.Thin;
+                ws.Column(1).Width = 16;
+                for (int c = 2; c <= headers.Length; c++) ws.Column(c).Width = 13;
+                ws.Row(1).Height = 32;
+
+                // ---------- Sheet 2: Payment Source Summary ----------
+                var ds = workbook.Worksheets.Add("Payment Source Summary");
+                ds.Cell(1, 1).Value = "Hour";
+                ds.Range(1, 1, 2, 1).Merge();
+                int col2 = 2;
+                foreach (var dev in HourlyDevices)
+                {
+                    ds.Cell(1, col2).Value = dev;
+                    ds.Range(1, col2, 1, col2 + 1).Merge();
+                    ds.Cell(2, col2).Value = "Count";
+                    ds.Cell(2, col2 + 1).Value = "Amount (KES)";
+                    col2 += 2;
+                }
+                ds.Cell(1, col2).Value = "Total";
+                ds.Range(1, col2, 1, col2 + 1).Merge();
+                ds.Cell(2, col2).Value = "Count";
+                ds.Cell(2, col2 + 1).Value = "Amount (KES)";
+                int lastCol = col2 + 1;
+
+                var dsHdr = ds.Range(1, 1, 2, lastCol);
+                dsHdr.Style.Font.Bold = true;
+                dsHdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                dsHdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                dsHdr.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
+                ds.SheetView.FreezeRows(2);
+
+                int dr = 3;
+                foreach (var h in rows)
+                {
+                    ds.Cell(dr, 1).Value = h.label;
+                    int cc = 2;
+                    foreach (var dev in HourlyDevices)
+                    {
+                        ds.Cell(dr, cc).Value = h.deviceCount[dev];
+                        ds.Cell(dr, cc + 1).Value = h.deviceAmount[dev];
+                        ds.Cell(dr, cc + 1).Style.NumberFormat.Format = "#,##0.00";
+                        cc += 2;
+                    }
+                    ds.Cell(dr, cc).Value = h.count;
+                    ds.Cell(dr, cc + 1).Value = h.totalPaid;
+                    ds.Cell(dr, cc + 1).Style.NumberFormat.Format = "#,##0.00";
+                    dr++;
+                }
+
+                ds.Cell(dr, 1).Value = "TOTAL";
+                for (int c = 2; c <= lastCol; c++)
+                {
+                    string col = ds.Cell(3, c).Address.ColumnLetter;
+                    ds.Cell(dr, c).FormulaA1 = $"=SUM({col}3:{col}{dr - 1})";
+                    if (c % 2 == 1) ds.Cell(dr, c).Style.NumberFormat.Format = "#,##0.00";
+                }
+                var dsTotal = ds.Range(dr, 1, dr, lastCol);
+                dsTotal.Style.Font.Bold = true;
+                dsTotal.Style.Fill.BackgroundColor = XLColor.Gold;
+                ds.Range(1, 1, dr, lastCol).Style.Border.OutsideBorder = XLBorderStyleValues.Thick;
+                ds.Range(1, 1, dr, lastCol).Style.Border.InsideBorder = XLBorderStyleValues.Thin;
+                ds.Column(1).Width = 16;
+                for (int c = 2; c <= lastCol; c++) ds.Column(c).Width = 13;
+
+                // ---------- Sheet 3: Transactions ----------
+                var ts = workbook.Worksheets.Add("Transactions");
+                string[] th = {
+                    "#", "Hour", "Transaction ID", "Card Number", "Card Name", "Entry Time",
+                    "Validation Time", "Amount (KES)", "Pay Mode", "Payment Source", "Status"
+                };
+                for (int c = 0; c < th.Length; c++)
+                    ts.Cell(1, c + 1).Value = th[c];
+                var tsHdr = ts.Range(1, 1, 1, th.Length);
+                tsHdr.Style.Font.Bold = true;
+                tsHdr.Style.Fill.BackgroundColor = XLColor.LightGray;
+                tsHdr.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                ts.SheetView.FreezeRows(1);
+
+                int tr = 2;
+                int no = 1;
+                foreach (var t in txns)
+                {
+                    ts.Cell(tr, 1).Value = no++;
+                    ts.Cell(tr, 2).Value = t.hourLabel ?? "";
+                    ts.Cell(tr, 3).Value = t.transactionId ?? "";
+                    ts.Cell(tr, 4).Value = t.cardNo ?? "";
+                    ts.Cell(tr, 5).Value = t.cardName ?? "";
+                    ts.Cell(tr, 6).Value = t.entryTime ?? "";
+                    ts.Cell(tr, 7).Value = t.validationTime ?? "";
+                    ts.Cell(tr, 8).Value = t.amount;
+                    ts.Cell(tr, 8).Style.NumberFormat.Format = "#,##0.00";
+                    ts.Cell(tr, 9).Value = t.payMode ?? "";
+                    ts.Cell(tr, 10).Value = t.paySource ?? "";
+                    ts.Cell(tr, 11).Value = t.status ?? "";
+                    tr++;
+                }
+                ts.Columns().AdjustToContents();
+
+                using var stream = new MemoryStream();
+                workbook.SaveAs(stream);
+                stream.Position = 0;
+                var fileName = $"HOURLY_TRANSACTION_REPORT_{d:dd-MMM-yyyy}_{DateTime.Now:HH-mm-ss}.xlsx";
+                return File(stream.ToArray(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    fileName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in ExportHourlyTransactionExcel: {ex.Message}\n{ex.StackTrace}");
+                return BadRequest($"Error: {ex.Message}");
+            }
+        }
+
+        // ============================================
+        // YEARLY COLLECTION REPORT (NEW)
+        // Built from existing monthly service methods (month-wise totals)
+        // ============================================
+        public class YearlyExitedRow
+        {
+            public int month { get; set; }
+            public string label { get; set; }
+            public int totalVehicles { get; set; }
+            public int cashCount { get; set; }
+            public decimal cashTotal { get; set; }
+            public int mPesaCount { get; set; }
+            public decimal mPesaTotal { get; set; }
+            public int focCount { get; set; }
+            public decimal focAmount { get; set; }
+            public int ctmFocCount { get; set; }
+            public decimal ctmFocAmount { get; set; }
+            public int zeroChargeCount { get; set; }
+            public int permanentParkersCount { get; set; }
+            public int revalidationCount { get; set; }
+            public decimal revalidationAmount { get; set; }
+            public decimal totalCharges { get; set; }
+            public decimal discount { get; set; }
+            public decimal totalPaid { get; set; }
+            public int vipCount { get; set; }
+        }
+
+        public class YearlyTransRow
+        {
+            public int month { get; set; }
+            public string label { get; set; }
+            public int totalVehicles { get; set; }
+            public int totalTransactions { get; set; }
+            public int cashCount { get; set; }
+            public decimal cashTotal { get; set; }
+            public int mPesaCount { get; set; }
+            public decimal mPesaTotal { get; set; }
+            public int cashTopUpCount { get; set; }
+            public decimal cashTopUpTotal { get; set; }
+            public int mPesaTopUpCount { get; set; }
+            public decimal mPesaTopUpTotal { get; set; }
+            public int focCount { get; set; }
+            public decimal focAmount { get; set; }
+            public int ctmFocCount { get; set; }
+            public decimal ctmFocAmount { get; set; }
+            public decimal totalChargedAmount { get; set; }
+            public decimal totalCollected { get; set; }
+        }
+
+        private static bool IsFutureMonth(int year, int month)
+        {
+            var now = DateTime.Now;
+            return year > now.Year || (year == now.Year && month > now.Month);
+        }
+
+        private async Task<List<YearlyExitedRow>> BuildYearlyExited(int year)
+        {
+            var rows = new List<YearlyExitedRow>();
+            for (int m = 1; m <= 12; m++)
+            {
+                var row = new YearlyExitedRow
+                {
+                    month = m,
+                    label = new DateTime(year, m, 1).ToString("MMMM yyyy", CultureInfo.InvariantCulture)
+                };
+                rows.Add(row);
+
+                if (IsFutureMonth(year, m)) continue;
+
+                var data = await _collectionService.GetMonthlyCollectionData(year, m);
+                if (data == null) continue;
+
+                foreach (dynamic item in data)
+                {
+                    row.totalVehicles += Convert.ToInt32(item.totalVehicles);
+                    row.cashCount += Convert.ToInt32(item.cashCount);
+                    row.cashTotal += Convert.ToDecimal(item.cashTotal);
+                    row.mPesaCount += Convert.ToInt32(item.mPesaCount);
+                    row.mPesaTotal += Convert.ToDecimal(item.mPesaTotal);
+                    row.focCount += Convert.ToInt32(item.focCount);
+                    row.focAmount += Convert.ToDecimal(item.focAmount);
+                    row.ctmFocCount += Convert.ToInt32(item.ctmFocCount);
+                    row.ctmFocAmount += Convert.ToDecimal(item.ctmFocAmount);
+                    row.zeroChargeCount += Convert.ToInt32(item.zeroChargeCount);
+                    row.permanentParkersCount += Convert.ToInt32(item.permanentParkersCount);
+                    row.revalidationCount += Convert.ToInt32(item.revalidationCount);
+                    row.revalidationAmount += Convert.ToDecimal(item.revalidationAmount);
+                    row.totalCharges += Convert.ToDecimal(item.totalCharges);
+                    row.discount += Convert.ToDecimal(item.discount);
+                    row.totalPaid += Convert.ToDecimal(item.totalPaid);
+                    row.vipCount += Convert.ToInt32(item.vipCount);
+                }
+            }
+            return rows;
+        }
+
+        private async Task<List<YearlyTransRow>> BuildYearlyTransactions(int year)
+        {
+            var rows = new List<YearlyTransRow>();
+            for (int m = 1; m <= 12; m++)
+            {
+                var row = new YearlyTransRow
+                {
+                    month = m,
+                    label = new DateTime(year, m, 1).ToString("MMMM yyyy", CultureInfo.InvariantCulture)
+                };
+                rows.Add(row);
+
+                if (IsFutureMonth(year, m)) continue;
+
+                var data = await _collectionService.GetMonthlyTransactionsDataWithVehicles(year, m);
+                if (data == null) continue;
+
+                foreach (dynamic item in data)
+                {
+                    row.totalVehicles += Convert.ToInt32(item.totalVehicles);
+                    row.totalTransactions += Convert.ToInt32(item.totalTransactions);
+                    row.cashCount += Convert.ToInt32(item.cashCount);
+                    row.cashTotal += Convert.ToDecimal(item.cashTotal);
+                    row.mPesaCount += Convert.ToInt32(item.mPesaCount);
+                    row.mPesaTotal += Convert.ToDecimal(item.mPesaTotal);
+                    row.cashTopUpCount += Convert.ToInt32(item.cashTopUpCount);
+                    row.cashTopUpTotal += Convert.ToDecimal(item.cashTopUpTotal);
+                    row.mPesaTopUpCount += Convert.ToInt32(item.mPesaTopUpCount);
+                    row.mPesaTopUpTotal += Convert.ToDecimal(item.mPesaTopUpTotal);
+                    row.focCount += Convert.ToInt32(item.focCount);
+                    row.focAmount += Convert.ToDecimal(item.focAmount);
+                    row.ctmFocCount += Convert.ToInt32(item.ctmFocCount);
+                    row.ctmFocAmount += Convert.ToDecimal(item.ctmFocAmount);
+                    row.totalChargedAmount += Convert.ToDecimal(item.totalChargedAmount);
+                }
+
+                row.totalCollected = row.cashTotal + row.mPesaTotal + row.cashTopUpTotal + row.mPesaTopUpTotal;
+            }
+            return rows;
+        }
+
+        private static void WriteYearlySheet(XLWorkbook workbook, string sheetName, string title,
+            string[] headers, List<object[]> data, int[] amountCols)
+        {
+            var ws = workbook.Worksheets.Add(sheetName);
+
+            ws.Cell(1, 1).Value = title;
+            ws.Cell(1, 1).Style.Font.Bold = true;
+            ws.Cell(1, 1).Style.Font.FontSize = 14;
+            ws.Cell(1, 1).Style.Fill.BackgroundColor = XLColor.LightBlue;
+            ws.Range(1, 1, 1, headers.Length).Merge();
+
+            for (int c = 0; c < headers.Length; c++)
+            {
+                var cell = ws.Cell(2, c + 1);
+                cell.Value = headers[c];
+                cell.Style.Font.Bold = true;
+                cell.Style.Fill.BackgroundColor = XLColor.Gray;
+                cell.Style.Font.FontColor = XLColor.White;
+                cell.Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                cell.Style.Alignment.Vertical = XLAlignmentVerticalValues.Center;
+                cell.Style.Alignment.WrapText = true;
+                ws.Column(c + 1).Width = 13;
+            }
+            ws.Column(1).Width = 18;
+            ws.Row(2).Height = 32;
+
+            int r = 3;
+            foreach (var vals in data)
+            {
+                for (int c = 0; c < vals.Length; c++)
+                    ws.Cell(r, c + 1).Value = XLCellValue.FromObject(vals[c]);
+                r++;
+            }
+
+            ws.Cell(r, 1).Value = "TOTAL";
+            for (int c = 2; c <= headers.Length; c++)
+            {
+                string col = ws.Cell(3, c).Address.ColumnLetter;
+                ws.Cell(r, c).FormulaA1 = $"=SUM({col}3:{col}{r - 1})";
+            }
+
+            foreach (var c in amountCols)
+                ws.Range(3, c, r, c).Style.NumberFormat.Format = "#,##0.00";
+
+            var totalRange = ws.Range(r, 1, r, headers.Length);
+            totalRange.Style.Font.Bold = true;
+            totalRange.Style.Fill.BackgroundColor = XLColor.Gold;
+
+            var all = ws.Range(2, 1, r, headers.Length);
+            all.Style.Border.OutsideBorder = XLBorderStyleValues.Thick;
+            all.Style.Border.InsideBorder = XLBorderStyleValues.Thin;
+            ws.SheetView.FreezeRows(2);
+            ws.SheetView.FreezeColumns(1);
+        }
+
+        public IActionResult Yearly()
+        {
+            return View();
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetYearlyExitedCarsData(int year)
+        {
+            try
+            {
+                var rows = await BuildYearlyExited(year);
+                return Json(new { success = true, data = rows });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in GetYearlyExitedCarsData: {ex.Message}\n{ex.StackTrace}");
+                return Json(new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetYearlyTransactionsData(int year)
+        {
+            try
+            {
+                var rows = await BuildYearlyTransactions(year);
+                return Json(new { success = true, data = rows });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in GetYearlyTransactionsData: {ex.Message}\n{ex.StackTrace}");
+                return Json(new { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> ExportYearlyExcel(int year)
+        {
+            try
+            {
+                var rows = await BuildYearlyExited(year);
+
+                string[] headers = {
+                    "Month", "Vehicles", "Cash Count", "Cash (KES)", "M-Pesa Count", "M-Pesa (KES)",
+                    "FOC Count", "FOC Amount (KES)", "HHD-4 FOC Count", "HHD-4 FOC Amount (KES)",
+                    "Zero Charge Count", "Permanent Parkers", "Revalidation Count", "Revalidation Amt (KES)",
+                    "Total Charges (KES)", "Discount (KES)", "Total Paid (KES)", "VIP"
+                };
+
+                var data = rows.Select(r => new object[]
+                {
+                    r.label, r.totalVehicles, r.cashCount, r.cashTotal, r.mPesaCount, r.mPesaTotal,
+                    r.focCount, r.focAmount, r.ctmFocCount, r.ctmFocAmount,
+                    r.zeroChargeCount, r.permanentParkersCount, r.revalidationCount, r.revalidationAmount,
+                    r.totalCharges, r.discount, r.totalPaid, r.vipCount
+                }).ToList();
+
+                using var workbook = new XLWorkbook();
+                WriteYearlySheet(workbook, $"Yearly {year}", $"YEARLY EXITED CARS SUMMARY - {year}",
+                    headers, data, new[] { 4, 6, 8, 10, 14, 15, 16, 17 });
+
+                using var stream = new MemoryStream();
+                workbook.SaveAs(stream);
+                stream.Position = 0;
+                return File(stream.ToArray(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    $"YEARLY_COLLECTION_{year}_{DateTime.Now:HH-mm-ss}.xlsx");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in ExportYearlyExcel: {ex.Message}\n{ex.StackTrace}");
+                return BadRequest($"Error: {ex.Message}");
+            }
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> ExportYearlyTransactionsExcel(int year)
+        {
+            try
+            {
+                var rows = await BuildYearlyTransactions(year);
+
+                string[] headers = {
+                    "Month", "Vehicles", "Transactions", "Cash Count", "Cash (KES)", "M-Pesa Count", "M-Pesa (KES)",
+                    "Cash Count (TOP-UP)", "Cash (KES) (TOP-UP)", "M-Pesa Count (TOP-UP)", "M-Pesa (KES) (TOP-UP)",
+                    "FOC Count", "FOC Amount (KES)", "HHD-4 FOC Count", "HHD-4 FOC Amount (KES)",
+                    "Total Charged (KES)", "Total Collected (KES)"
+                };
+
+                var data = rows.Select(r => new object[]
+                {
+                    r.label, r.totalVehicles, r.totalTransactions, r.cashCount, r.cashTotal, r.mPesaCount, r.mPesaTotal,
+                    r.cashTopUpCount, r.cashTopUpTotal, r.mPesaTopUpCount, r.mPesaTopUpTotal,
+                    r.focCount, r.focAmount, r.ctmFocCount, r.ctmFocAmount,
+                    r.totalChargedAmount, r.totalCollected
+                }).ToList();
+
+                using var workbook = new XLWorkbook();
+                WriteYearlySheet(workbook, $"Yearly {year}", $"YEARLY TRANSACTIONS SUMMARY - {year}",
+                    headers, data, new[] { 5, 7, 9, 11, 13, 15, 16, 17 });
+
+                using var stream = new MemoryStream();
+                workbook.SaveAs(stream);
+                stream.Position = 0;
+                return File(stream.ToArray(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    $"YEARLY_TRANSACTIONS_{year}_{DateTime.Now:HH-mm-ss}.xlsx");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error in ExportYearlyTransactionsExcel: {ex.Message}\n{ex.StackTrace}");
+                return BadRequest($"Error: {ex.Message}");
+            }
+        }
+
         // Helper method to get property value from anonymous/dynamic objects
         private object GetPropertyValue(object obj, string propertyName)
         {

@@ -17,8 +17,11 @@ namespace AmaanParkingSystem.Controllers
         // ── Hardcoded card types — matches db_tbl_10_cards_master order ──────
         private static readonly string[] CardTypes = new[]
         {
-            "Temporary", "SEASONAL", "VIP", "DAILY_ACCESS", "CASH_CARD"
+                      "Temporary", "SEASONAL", "VIP", "DAILY_ACCESS", "CASH_CARD"
         };
+
+        // ── Total parking capacity (bays) used by the Occupancy report ───────
+        private const int ParkingCapacity = 500;
 
         public AccessReportController(ILogger<AccessReportController> logger)
         {
@@ -68,6 +71,7 @@ namespace AmaanParkingSystem.Controllers
 
                 const string sql = @"
 WITH hrs AS (
+
     SELECT TOP 24 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS hr
     FROM sys.all_columns
 ),
@@ -99,24 +103,26 @@ ex AS (
     WHERE exit_time >= @start AND exit_time < @end
     GROUP BY card_type, DATEPART(HOUR, exit_time)
 ),
--- REMAIN: cars physically inside at the END of each hour
--- = (active table: entered in or before this hour, still inside)
--- + (exited table: entered in or before this hour, exited AFTER this hour ended)
+-- REMAIN (occupancy): cars physically inside at the END of each hour
+-- = entered before hour end AND (not yet exited  OR  exited at/after hour end)
+-- Includes cars that entered on previous days and are still parked.
 rm AS (
-    -- Still inside (active table) — entered in this hour
-    SELECT card_type, DATEPART(HOUR, entry_time) AS hr, COUNT(*) AS cnt
-    FROM dbo.db_tbl_14_car_enterd
-    WHERE entry_time >= @start AND entry_time < @end
-    GROUP BY card_type, DATEPART(HOUR, entry_time)
-
-    UNION ALL
-
-    -- Entered today this hour, exited tomorrow or later
-    SELECT card_type, DATEPART(HOUR, entry_time) AS hr, COUNT(*) AS cnt
-    FROM dbo.db_tbl_15_car_exited
-    WHERE entry_time >= @start AND entry_time < @end
-      AND exit_time  >= @end
-    GROUP BY card_type, DATEPART(HOUR, entry_time)
+    SELECT s.hr, s.card_type,
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_14_car_enterd a
+            WHERE a.card_type = s.card_type
+              AND a.entry_time < DATEADD(HOUR, s.hr + 1, @start)
+        )
+        +
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_15_car_exited x
+            WHERE x.card_type = s.card_type
+              AND x.entry_time < DATEADD(HOUR, s.hr + 1, @start)
+              AND x.exit_time >= DATEADD(HOUR, s.hr + 1, @start)
+        ) AS cnt
+    FROM spine s
 )
 SELECT
     s.hr,
@@ -130,11 +136,7 @@ FROM spine s
 LEFT JOIN ea ON ea.card_type = s.card_type AND ea.hr = s.hr
 LEFT JOIN ee ON ee.card_type = s.card_type AND ee.hr = s.hr
 LEFT JOIN ex ON ex.card_type = s.card_type AND ex.hr = s.hr
-LEFT JOIN (
-    SELECT card_type, hr, SUM(cnt) AS cnt
-    FROM rm
-    GROUP BY card_type, hr
-) rm ON rm.card_type = s.card_type AND rm.hr = s.hr
+LEFT JOIN rm ON rm.card_type = s.card_type AND rm.hr = s.hr
 ORDER BY s.hr, s.card_type;";
 
                 using var conn = new SqlConnection(GetDynamicConnectionString());
@@ -204,22 +206,26 @@ ex AS (
     WHERE exit_time >= @start AND exit_time < @end
     GROUP BY card_type, DATEDIFF(DAY, @start, exit_time)
 ),
--- REMAIN: cars physically inside at END of each day
--- = active vehicles that entered this day
--- + exited vehicles that entered this day but exited on a future day
+-- REMAIN (occupancy): cars physically inside at the END of each day
+-- = entered before day end AND (not yet exited OR exited at/after day end)
+-- Includes cars carried over from earlier days/months.
 rm AS (
-    SELECT card_type, DATEDIFF(DAY, @start, entry_time) + 1 AS d, COUNT(*) AS cnt
-    FROM dbo.db_tbl_14_car_enterd
-    WHERE entry_time >= @start AND entry_time < @end
-    GROUP BY card_type, DATEDIFF(DAY, @start, entry_time)
-
-    UNION ALL
-
-    SELECT card_type, DATEDIFF(DAY, @start, entry_time) + 1 AS d, COUNT(*) AS cnt
-    FROM dbo.db_tbl_15_car_exited
-    WHERE entry_time >= @start AND entry_time < @end
-      AND exit_time  >= @end
-    GROUP BY card_type, DATEDIFF(DAY, @start, entry_time)
+    SELECT s.d, s.card_type,
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_14_car_enterd a
+            WHERE a.card_type = s.card_type
+              AND a.entry_time < DATEADD(DAY, 1, s.day_date)
+        )
+        +
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_15_car_exited x
+            WHERE x.card_type = s.card_type
+              AND x.entry_time < DATEADD(DAY, 1, s.day_date)
+              AND x.exit_time >= DATEADD(DAY, 1, s.day_date)
+        ) AS cnt
+    FROM spine s
 )
 SELECT
     s.d,
@@ -232,9 +238,7 @@ FROM spine s
 LEFT JOIN ea  ON ea.card_type  = s.card_type AND ea.d  = s.d
 LEFT JOIN ee  ON ee.card_type  = s.card_type AND ee.d  = s.d
 LEFT JOIN ex  ON ex.card_type  = s.card_type AND ex.d  = s.d
-LEFT JOIN (
-    SELECT card_type, d, SUM(cnt) AS cnt FROM rm GROUP BY card_type, d
-) rm2 ON rm2.card_type = s.card_type AND rm2.d = s.d
+LEFT JOIN rm rm2 ON rm2.card_type = s.card_type AND rm2.d = s.d
 ORDER BY s.d, s.card_type;";
 
                 using var conn = new SqlConnection(GetDynamicConnectionString());
@@ -303,22 +307,26 @@ ex AS (
     WHERE exit_time >= @start AND exit_time < @end
     GROUP BY card_type, DATEDIFF(MONTH, @start, exit_time)
 ),
--- REMAIN: cars physically inside at END of each month
--- = active vehicles that entered this month (still inside)
--- + exited vehicles that entered this month but exited in a future month
+-- REMAIN (occupancy): cars physically inside at the END of each month
+-- = entered before month end AND (not yet exited OR exited at/after month end)
+-- Includes cars carried over from earlier months/years.
 rm AS (
-    SELECT card_type, DATEDIFF(MONTH, @start, entry_time) + 1 AS mn, COUNT(*) AS cnt
-    FROM dbo.db_tbl_14_car_enterd
-    WHERE entry_time >= @start AND entry_time < @end
-    GROUP BY card_type, DATEDIFF(MONTH, @start, entry_time)
-
-    UNION ALL
-
-    SELECT card_type, DATEDIFF(MONTH, @start, entry_time) + 1 AS mn, COUNT(*) AS cnt
-    FROM dbo.db_tbl_15_car_exited
-    WHERE entry_time >= @start AND entry_time < @end
-      AND exit_time  >= @end
-    GROUP BY card_type, DATEDIFF(MONTH, @start, entry_time)
+    SELECT s.mn, s.card_type,
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_14_car_enterd a
+            WHERE a.card_type = s.card_type
+              AND a.entry_time < DATEADD(MONTH, s.mn, @start)
+        )
+        +
+        (
+            SELECT COUNT(*)
+            FROM dbo.db_tbl_15_car_exited x
+            WHERE x.card_type = s.card_type
+              AND x.entry_time < DATEADD(MONTH, s.mn, @start)
+              AND x.exit_time >= DATEADD(MONTH, s.mn, @start)
+        ) AS cnt
+    FROM spine s
 )
 SELECT
     s.mn,
@@ -331,9 +339,7 @@ FROM spine s
 LEFT JOIN ea  ON ea.card_type  = s.card_type AND ea.mn  = s.mn
 LEFT JOIN ee  ON ee.card_type  = s.card_type AND ee.mn  = s.mn
 LEFT JOIN ex  ON ex.card_type  = s.card_type AND ex.mn  = s.mn
-LEFT JOIN (
-    SELECT card_type, mn, SUM(cnt) AS cnt FROM rm GROUP BY card_type, mn
-) rm2 ON rm2.card_type = s.card_type AND rm2.mn = s.mn
+LEFT JOIN rm rm2 ON rm2.card_type = s.card_type AND rm2.mn = s.mn
 ORDER BY s.mn, s.card_type;";
 
                 using var conn = new SqlConnection(GetDynamicConnectionString());
@@ -358,60 +364,76 @@ ORDER BY s.mn, s.card_type;";
             }
         }
 
-        // =====================================================================
-        // OCCUPANCY — Hourly
-        // =====================================================================
         [HttpPost]
         public async Task<IActionResult> GetHourlyOccupancy(DateTime? selectedDate)
         {
             try
             {
                 using var conn = new SqlConnection(GetDynamicConnectionString());
-                var reportDate = selectedDate?.Date ?? DateTime.Today;
-                var start = reportDate;
-                var end = reportDate.AddDays(1);
+                var start = (selectedDate?.Date) ?? DateTime.Today;
+                var end = start.AddDays(1);
+                var now = DateTime.Now;
 
                 const string sql = @"
-;WITH hours_cte AS (
-    SELECT 0 AS hr
+WITH hrs AS (
+    SELECT TOP 24 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS hr
+    FROM sys.all_columns
+),
+base AS (
+    SELECT
+        (SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd WHERE entry_time < @start)
+      + (SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited WHERE entry_time < @start AND exit_time >= @start) AS open_cnt
+),
+ev AS (
+    SELECT entry_time AS t, 1 AS dl FROM dbo.db_tbl_14_car_enterd
+    WHERE entry_time >= @start AND entry_time < @end
     UNION ALL
-    SELECT hr + 1 FROM hours_cte WHERE hr < 23
+    SELECT entry_time, 1 FROM dbo.db_tbl_15_car_exited
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT exit_time, -1 FROM dbo.db_tbl_15_car_exited
+    WHERE exit_time >= @start AND exit_time < @end
+),
+run AS (
+    SELECT e.t, e.dl,
+           b.open_cnt + SUM(e.dl) OVER (ORDER BY e.t, e.dl DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_inside
+    FROM ev e CROSS JOIN base b
+),
+agg AS (
+    SELECT DATEDIFF(HOUR, @start, t) AS hr,
+           SUM(CASE WHEN dl = 1  THEN 1 ELSE 0 END) AS cin,
+           SUM(CASE WHEN dl = -1 THEN 1 ELSE 0 END) AS cout,
+           MAX(cnt_inside) AS peak
+    FROM run
+    GROUP BY DATEDIFF(HOUR, @start, t)
+),
+cum AS (
+    SELECT h.hr,
+           ISNULL(a.cin, 0)  AS cin,
+           ISNULL(a.cout, 0) AS cout,
+           a.peak,
+           b.open_cnt + SUM(ISNULL(a.cin, 0) - ISNULL(a.cout, 0))
+               OVER (ORDER BY h.hr ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closing
+    FROM hrs h
+    LEFT JOIN agg a ON a.hr = h.hr
+    CROSS JOIN base b
 )
 SELECT
-    h.hr AS report_hour,
-    RIGHT('0'+CAST(h.hr   AS VARCHAR(2)),2)+':00 - '+
-    RIGHT('0'+CAST(h.hr+1 AS VARCHAR(2)),2)+':00'      AS hour_label,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd e
-        WHERE e.entry_time >= @start AND e.entry_time < @end
-          AND DATEPART(HOUR, e.entry_time) = h.hr
-    ) +
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited ex
-        WHERE ex.entry_time >= @start AND ex.entry_time < @end
-          AND DATEPART(HOUR, ex.entry_time) = h.hr
-    ) AS total_entered,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited x
-        WHERE x.exit_time >= @start AND x.exit_time < @end
-          AND DATEPART(HOUR, x.exit_time) = h.hr
-    ) AS total_exited,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd s
-        WHERE s.entry_time >= @start AND s.entry_time < @end
-          AND DATEPART(HOUR, s.entry_time) <= h.hr
-    ) AS still_inside,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited l
-        WHERE l.entry_time >= @start AND l.entry_time < @end
-          AND DATEPART(HOUR, l.entry_time) = h.hr
-    ) AS left_after_entry
-FROM hours_cte h
-ORDER BY h.hr
-OPTION (MAXRECURSION 24);";
+    c.hr AS report_hour,
+    RIGHT('0'+CAST(c.hr   AS VARCHAR(2)),2)+':00 - '+
+    RIGHT('0'+CAST(c.hr+1 AS VARCHAR(2)),2)+':00'      AS hour_label,
+    c.cin  AS total_entered,
+    c.cout AS total_exited,
+    c.closing - c.cin + c.cout AS opening,
+    c.closing                  AS still_inside,
+    CASE WHEN c.peak IS NULL OR c.peak < (c.closing - c.cin + c.cout)
+         THEN (c.closing - c.cin + c.cout) ELSE c.peak END AS peak_inside
+FROM cum c
+WHERE DATEADD(HOUR, c.hr, @start) <= @now
+ORDER BY c.hr;";
 
-                var data = await conn.QueryAsync(sql, new { start, end });
-                return Json(new { success = true, count = data.Count(), data });
+                var data = await conn.QueryAsync(sql, new { start, end, now });
+                return Json(new { success = true, count = data.Count(), capacity = ParkingCapacity, data });
             }
             catch (Exception ex)
             {
@@ -433,31 +455,43 @@ OPTION (MAXRECURSION 24);";
                 var end = start.AddDays(1);
 
                 const string sql = @"
+WITH base AS (
+    SELECT
+        (SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd WHERE entry_time < @start)
+      + (SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited WHERE entry_time < @start AND exit_time >= @start) AS open_cnt
+),
+ev AS (
+    SELECT entry_time AS t, 1 AS dl FROM dbo.db_tbl_14_car_enterd
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT entry_time, 1 FROM dbo.db_tbl_15_car_exited
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT exit_time, -1 FROM dbo.db_tbl_15_car_exited
+    WHERE exit_time >= @start AND exit_time < @end
+),
+run AS (
+    SELECT e.t, e.dl,
+           b.open_cnt + SUM(e.dl) OVER (ORDER BY e.t, e.dl DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_inside
+    FROM ev e CROSS JOIN base b
+),
+tot AS (
+    SELECT ISNULL(SUM(CASE WHEN dl = 1  THEN 1 ELSE 0 END), 0) AS cin,
+           ISNULL(SUM(CASE WHEN dl = -1 THEN 1 ELSE 0 END), 0) AS cout,
+           MAX(cnt_inside) AS peak
+    FROM run
+)
 SELECT
     @start AS report_date,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd e
-        WHERE e.entry_time >= @start AND e.entry_time < @end
-    ) +
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited ex
-        WHERE ex.entry_time >= @start AND ex.entry_time < @end
-    ) AS total_entered,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited x
-        WHERE x.exit_time >= @start AND x.exit_time < @end
-    ) AS total_exited,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd s
-        WHERE s.entry_time >= @start AND s.entry_time < @end
-    ) AS still_inside,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited l
-        WHERE l.entry_time >= @start AND l.entry_time < @end
-    ) AS left_after_entry;";
+    b.open_cnt                          AS opening,
+    t.cin                               AS total_entered,
+    t.cout                              AS total_exited,
+    b.open_cnt + t.cin - t.cout         AS still_inside,
+    CASE WHEN t.peak IS NULL OR t.peak < b.open_cnt THEN b.open_cnt ELSE t.peak END AS peak_inside
+FROM tot t CROSS JOIN base b;";
 
                 var data = await conn.QueryFirstOrDefaultAsync(sql, new { start, end });
-                return Json(new { success = true, data });
+                return Json(new { success = true, capacity = ParkingCapacity, data });
             }
             catch (Exception ex)
             {
@@ -478,48 +512,66 @@ SELECT
                 var start = new DateTime(year, month, 1);
                 var end = start.AddMonths(1);
                 int days = DateTime.DaysInMonth(year, month);
+                var now = DateTime.Now;
 
                 const string sql = @"
 WITH day_nums AS (
-    SELECT TOP (@days) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS d
+    SELECT TOP (@days) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS dn
     FROM sys.all_columns
 ),
-spine AS (
-    SELECT DATEADD(DAY, d - 1, @start) AS day_date, d
-    FROM day_nums
+base AS (
+    SELECT
+        (SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd WHERE entry_time < @start)
+      + (SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited WHERE entry_time < @start AND exit_time >= @start) AS open_cnt
+),
+ev AS (
+    SELECT entry_time AS t, 1 AS dl FROM dbo.db_tbl_14_car_enterd
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT entry_time, 1 FROM dbo.db_tbl_15_car_exited
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT exit_time, -1 FROM dbo.db_tbl_15_car_exited
+    WHERE exit_time >= @start AND exit_time < @end
+),
+run AS (
+    SELECT e.t, e.dl,
+           b.open_cnt + SUM(e.dl) OVER (ORDER BY e.t, e.dl DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_inside
+    FROM ev e CROSS JOIN base b
+),
+agg AS (
+    SELECT DATEDIFF(DAY, @start, t) + 1 AS dn,
+           SUM(CASE WHEN dl = 1  THEN 1 ELSE 0 END) AS cin,
+           SUM(CASE WHEN dl = -1 THEN 1 ELSE 0 END) AS cout,
+           MAX(cnt_inside) AS peak
+    FROM run
+    GROUP BY DATEDIFF(DAY, @start, t) + 1
+),
+cum AS (
+    SELECT dd.dn,
+           ISNULL(a.cin, 0)  AS cin,
+           ISNULL(a.cout, 0) AS cout,
+           a.peak,
+           b.open_cnt + SUM(ISNULL(a.cin, 0) - ISNULL(a.cout, 0))
+               OVER (ORDER BY dd.dn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closing
+    FROM day_nums dd
+    LEFT JOIN agg a ON a.dn = dd.dn
+    CROSS JOIN base b
 )
 SELECT
-    s.day_date AS report_date,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd e1
-        WHERE e1.entry_time >= s.day_date
-          AND e1.entry_time <  DATEADD(DAY, 1, s.day_date)
-    ) +
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited e2
-        WHERE e2.entry_time >= s.day_date
-          AND e2.entry_time <  DATEADD(DAY, 1, s.day_date)
-    ) AS total_entered,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited x
-        WHERE x.exit_time >= s.day_date
-          AND x.exit_time <  DATEADD(DAY, 1, s.day_date)
-    ) AS total_exited,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd si
-        WHERE si.entry_time >= s.day_date
-          AND si.entry_time <  DATEADD(DAY, 1, s.day_date)
-    ) AS still_inside,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited l
-        WHERE l.entry_time >= s.day_date
-          AND l.entry_time <  DATEADD(DAY, 1, s.day_date)
-    ) AS left_after_entry
-FROM spine s
-ORDER BY s.day_date ASC;";
+    DATEADD(DAY, c.dn - 1, @start) AS report_date,
+    c.cin  AS total_entered,
+    c.cout AS total_exited,
+    c.closing - c.cin + c.cout AS opening,
+    c.closing                  AS still_inside,
+    CASE WHEN c.peak IS NULL OR c.peak < (c.closing - c.cin + c.cout)
+         THEN (c.closing - c.cin + c.cout) ELSE c.peak END AS peak_inside
+FROM cum c
+WHERE DATEADD(DAY, c.dn - 1, @start) <= @now
+ORDER BY c.dn;";
 
-                var data = await conn.QueryAsync(sql, new { start, end, days });
-                return Json(new { success = true, count = data.Count(), data });
+                var data = await conn.QueryAsync(sql, new { start, end, days, now });
+                return Json(new { success = true, count = data.Count(), capacity = ParkingCapacity, data });
             }
             catch (Exception ex)
             {
@@ -539,56 +591,68 @@ ORDER BY s.day_date ASC;";
                 using var conn = new SqlConnection(GetDynamicConnectionString());
                 var start = new DateTime(year, 1, 1);
                 var end = start.AddYears(1);
+                var now = DateTime.Now;
 
                 const string sql = @"
-WITH months AS (
-    SELECT  1 AS mn, 'January'   AS month_name UNION ALL
-    SELECT  2,       'February'               UNION ALL
-    SELECT  3,       'March'                  UNION ALL
-    SELECT  4,       'April'                  UNION ALL
-    SELECT  5,       'May'                    UNION ALL
-    SELECT  6,       'June'                   UNION ALL
-    SELECT  7,       'July'                   UNION ALL
-    SELECT  8,       'August'                 UNION ALL
-    SELECT  9,       'September'              UNION ALL
-    SELECT 10,       'October'                UNION ALL
-    SELECT 11,       'November'               UNION ALL
-    SELECT 12,       'December'
+WITH month_nums AS (
+    SELECT TOP 12 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS mn
+    FROM sys.all_columns
 ),
-spine AS (
-    SELECT mn, month_name,
-           DATEADD(MONTH, mn - 1, @start)              AS m_start,
-           DATEADD(MONTH, mn,     @start)              AS m_end
-    FROM months
+base AS (
+    SELECT
+        (SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd WHERE entry_time < @start)
+      + (SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited WHERE entry_time < @start AND exit_time >= @start) AS open_cnt
+),
+ev AS (
+    SELECT entry_time AS t, 1 AS dl FROM dbo.db_tbl_14_car_enterd
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT entry_time, 1 FROM dbo.db_tbl_15_car_exited
+    WHERE entry_time >= @start AND entry_time < @end
+    UNION ALL
+    SELECT exit_time, -1 FROM dbo.db_tbl_15_car_exited
+    WHERE exit_time >= @start AND exit_time < @end
+),
+run AS (
+    SELECT e.t, e.dl,
+           b.open_cnt + SUM(e.dl) OVER (ORDER BY e.t, e.dl DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt_inside
+    FROM ev e CROSS JOIN base b
+),
+agg AS (
+    SELECT DATEDIFF(MONTH, @start, t) + 1 AS mn,
+           SUM(CASE WHEN dl = 1  THEN 1 ELSE 0 END) AS cin,
+           SUM(CASE WHEN dl = -1 THEN 1 ELSE 0 END) AS cout,
+           MAX(cnt_inside) AS peak
+    FROM run
+    GROUP BY DATEDIFF(MONTH, @start, t) + 1
+),
+cum AS (
+    SELECT mm.mn,
+           ISNULL(a.cin, 0)  AS cin,
+           ISNULL(a.cout, 0) AS cout,
+           a.peak,
+           b.open_cnt + SUM(ISNULL(a.cin, 0) - ISNULL(a.cout, 0))
+               OVER (ORDER BY mm.mn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closing
+    FROM month_nums mm
+    LEFT JOIN agg a ON a.mn = mm.mn
+    CROSS JOIN base b
 )
 SELECT
-    s.mn           AS report_month,
-    s.month_name,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd e1
-        WHERE e1.entry_time >= s.m_start AND e1.entry_time < s.m_end
-    ) +
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited e2
-        WHERE e2.entry_time >= s.m_start AND e2.entry_time < s.m_end
-    ) AS total_entered,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited x
-        WHERE x.exit_time >= s.m_start AND x.exit_time < s.m_end
-    ) AS total_exited,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_14_car_enterd si
-        WHERE si.entry_time >= s.m_start AND si.entry_time < s.m_end
-    ) AS still_inside,
-    (
-        SELECT COUNT(*) FROM dbo.db_tbl_15_car_exited l
-        WHERE l.entry_time >= s.m_start AND l.entry_time < s.m_end
-    ) AS left_after_entry
-FROM spine s
-ORDER BY s.mn ASC;";
+    c.mn AS report_month,
+    CHOOSE(c.mn, 'January','February','March','April','May','June',
+                 'July','August','September','October','November','December') AS month_name,
+    c.cin  AS total_entered,
+    c.cout AS total_exited,
+    c.closing - c.cin + c.cout AS opening,
+    c.closing                  AS still_inside,
+    CASE WHEN c.peak IS NULL OR c.peak < (c.closing - c.cin + c.cout)
+         THEN (c.closing - c.cin + c.cout) ELSE c.peak END AS peak_inside
+FROM cum c
+WHERE DATEADD(MONTH, c.mn - 1, @start) <= @now
+ORDER BY c.mn;";
 
-                var data = await conn.QueryAsync(sql, new { start, end });
-                return Json(new { success = true, count = data.Count(), data });
+                var data = await conn.QueryAsync(sql, new { start, end, now });
+                return Json(new { success = true, count = data.Count(), capacity = ParkingCapacity, data });
             }
             catch (Exception ex)
             {

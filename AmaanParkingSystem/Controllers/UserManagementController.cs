@@ -488,6 +488,184 @@ public class UserManagementController : BaseController
 
 
     [HttpPost]
+    public IActionResult BulkAddCards([FromBody] BulkCardRequest request)
+    {
+        try
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.SubCoId))
+                return Json(new { success = false, message = "Please select a Sub Company." });
+
+            if (string.IsNullOrWhiteSpace(request.Status))
+                return Json(new { success = false, message = "Please select a Status." });
+
+            if (request.Rows == null || request.Rows.Count == 0)
+                return Json(new { success = false, message = "Please add at least one card." });
+
+            if (request.Rows.Count > 500)
+                return Json(new { success = false, message = "Maximum 500 cards can be saved at once." });
+
+            var rows = request.Rows
+                .Where(r => r != null)
+                .Select(r => new BulkCardRow
+                {
+                    RowNo = r.RowNo,
+                    CardNo = (r.CardNo ?? "").Trim(),
+                    CardName = (r.CardName ?? "").Trim(),
+                    OwnerName = (r.OwnerName ?? "").Trim(),
+                    OwnerContact = (r.OwnerContact ?? "").Trim(),
+                    PlateNo = (r.PlateNo ?? "").Trim()
+                }).ToList();
+
+            var errors = new List<object>();
+            void AddErr(int rowNo, string msg) { errors.Add(new { row = rowNo, message = msg }); }
+
+            // Validate inside the list
+            foreach (var r in rows.Where(x => string.IsNullOrEmpty(x.CardNo)))
+                AddErr(r.RowNo, "Card No is required");
+
+            foreach (var g in rows.Where(x => !string.IsNullOrEmpty(x.CardNo))
+                                  .GroupBy(x => x.CardNo.ToLower()).Where(g => g.Count() > 1))
+                foreach (var r in g)
+                    AddErr(r.RowNo, $"Card No '{r.CardNo}' is repeated in this list");
+
+            foreach (var g in rows.Where(x => !string.IsNullOrEmpty(x.CardName))
+                                  .GroupBy(x => x.CardName.ToLower()).Where(g => g.Count() > 1))
+                foreach (var r in g)
+                    AddErr(r.RowNo, $"Card Name '{r.CardName}' is repeated in this list");
+
+            using (var conn = new SqlConnection(GetDynamicConnectionString()))
+            {
+                var subCompanyInfo = conn.QueryFirstOrDefault(@"
+                SELECT customer_id, car_parkers_company_id, car_parkers_company_name, 
+                       car_parkers_sub_co_id, car_parkers_sub_co_name, applicable_card_type 
+                FROM [AMAAN_PMS].[dbo].[db_tbl_08_parkers_company] 
+                WHERE car_parkers_sub_co_id = @subCoId", new { subCoId = request.SubCoId });
+
+                if (subCompanyInfo == null)
+                    return Json(new { success = false, message = "Sub Company not found!" });
+
+                // Duplicate check against the database (same rule as AddOrEditCard)
+                var cardNos = rows.Where(x => !string.IsNullOrEmpty(x.CardNo))
+                                  .Select(x => x.CardNo.ToLower()).Distinct().ToList();
+                if (cardNos.Count > 0)
+                {
+                    var existingNos = conn.Query<string>(@"
+                    SELECT LTRIM(RTRIM(LOWER(cardno))) 
+                    FROM [AMAAN_PMS].[dbo].[db_tbl_11_cards_allocated]
+                    WHERE LTRIM(RTRIM(LOWER(cardno))) IN @list", new { list = cardNos }).ToHashSet();
+
+                    foreach (var r in rows.Where(x => !string.IsNullOrEmpty(x.CardNo) && existingNos.Contains(x.CardNo.ToLower())))
+                        AddErr(r.RowNo, $"Card No '{r.CardNo}' already exists");
+                }
+
+                var cardNames = rows.Where(x => !string.IsNullOrEmpty(x.CardName))
+                                    .Select(x => x.CardName.ToLower()).Distinct().ToList();
+                if (cardNames.Count > 0)
+                {
+                    var existingNames = conn.Query<string>(@"
+                    SELECT LTRIM(RTRIM(LOWER(cardname))) 
+                    FROM [AMAAN_PMS].[dbo].[db_tbl_11_cards_allocated]
+                    WHERE LTRIM(RTRIM(LOWER(cardname))) IN @list", new { list = cardNames }).ToHashSet();
+
+                    foreach (var r in rows.Where(x => !string.IsNullOrEmpty(x.CardName) && existingNames.Contains(x.CardName.ToLower())))
+                        AddErr(r.RowNo, $"Card Name '{r.CardName}' already exists");
+                }
+
+                if (errors.Count > 0)
+                    return Json(new { success = false, message = "Please fix the highlighted rows. Nothing was saved.", errors });
+
+                // Access rights (same binary logic as AddOrEditCard)
+                var zonesList = conn.Query("SELECT zone_name FROM [AMAAN_PMS].[dbo].[db_tbl_04_zones]").ToList();
+                var binaryRights = new StringBuilder();
+                foreach (var z in zonesList)
+                {
+                    binaryRights.Append((request.Zones != null && request.Zones.Contains((string)z.zone_name)) ? "1" : "0");
+                }
+                string assignedRights = binaryRights.ToString();
+
+                // Card type mapping (same as AddOrEditCard)
+                string cardType = subCompanyInfo.applicable_card_type;
+                var cMapping = new Dictionary<string, string> { { "FOC_PER_UNIT", "SEASONAL" }, { "PARKING_OWNER", "VIP" } };
+                if (cardType != null && cMapping.ContainsKey(cardType)) cardType = cMapping[cardType];
+
+                object subCustomerId = subCompanyInfo.customer_id;
+                object subCompanyId = subCompanyInfo.car_parkers_company_id;
+                object subCompanyName = subCompanyInfo.car_parkers_company_name;
+                object subCoId = subCompanyInfo.car_parkers_sub_co_id;
+                object subCoName = subCompanyInfo.car_parkers_sub_co_name;
+                var currentUser = GetLoggedInUser();
+
+                var items = rows.Select(r => new
+                {
+                    customer_id = subCustomerId,
+                    company_id = subCompanyId,
+                    company_name = subCompanyName,
+                    sub_id = subCoId,
+                    sub_name = subCoName,
+                    cardno = r.CardNo,
+                    cardname = string.IsNullOrEmpty(r.CardName) ? null : r.CardName,
+                    owner = string.IsNullOrEmpty(r.OwnerName) ? null : r.OwnerName,
+                    contact = string.IsNullOrEmpty(r.OwnerContact) ? null : r.OwnerContact,
+                    plate = string.IsNullOrEmpty(r.PlateNo) ? null : r.PlateNo,
+                    ctype = cardType,
+                    status = request.Status,
+                    fees = request.FeeScheduleId,
+                    app = request.ApplicationForm,
+                    expiry = request.ExpiryDate,
+                    rights = assignedRights,
+                    apb = request.AntiPassback,
+                    grp = request.Grouped,
+                    user = currentUser
+                }).ToList();
+
+                if (conn.State != System.Data.ConnectionState.Open) conn.Open();
+
+                using (var tran = conn.BeginTransaction())
+                {
+                    conn.Execute(@"
+                    INSERT INTO [AMAAN_PMS].[dbo].[db_tbl_11_cards_allocated]
+                    (customer_id, car_parkers_company_id, car_parkers_company_name, car_parkers_sub_co_id, car_parkers_sub_co_name, 
+                     cardno, cardname, car_owner_name, car_owner_contact_no, car_plate_no, card_type, status, 
+                     fee_schedule_id, applicationform, expiry_date, access_rights, antipassback, grouped, created_by, created_on)
+                    VALUES (@customer_id, @company_id, @company_name, @sub_id, @sub_name, @cardno, @cardname, @owner, @contact, 
+                            @plate, @ctype, @status, @fees, @app, @expiry, @rights, @apb, @grp, @user, GETDATE())", items, tran);
+
+                    tran.Commit();
+                }
+
+                return Json(new { success = true, message = $"{rows.Count} card(s) registered successfully.", inserted = rows.Count });
+            }
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, message = "Error: " + ex.Message });
+        }
+    }
+
+    public class BulkCardRow
+    {
+        public int RowNo { get; set; }
+        public string CardNo { get; set; }
+        public string CardName { get; set; }
+        public string OwnerName { get; set; }
+        public string OwnerContact { get; set; }
+        public string PlateNo { get; set; }
+    }
+
+    public class BulkCardRequest
+    {
+        public string SubCoId { get; set; }
+        public string Status { get; set; }
+        public string FeeScheduleId { get; set; }
+        public string ApplicationForm { get; set; }
+        public string ExpiryDate { get; set; }
+        public string AntiPassback { get; set; }
+        public string Grouped { get; set; }
+        public List<string> Zones { get; set; }
+        public List<BulkCardRow> Rows { get; set; }
+    }
+
+    [HttpPost]
     public IActionResult AddOrEditCard(CardRegistrationModel model, string[] zoneCheckboxes)
     {
         using (var conn = new SqlConnection(GetDynamicConnectionString()))

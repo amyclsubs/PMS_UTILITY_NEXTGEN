@@ -204,6 +204,12 @@
         <i class="fas fa-times"></i> Clear
     </button>
 }
+            @if (ViewBag.CanWrite == true)
+            {
+                <button type="button" class="btn btn-warning btn-sm" onclick="openBulkModal()" title="Bulk Card Registration">
+                    <i class="fas fa-layer-group"></i> Bulk Add
+                </button>
+            }
             <!-- Export Button -->
             <button type="button" class="btn btn-success btn-sm" id="exportExcelBtn" title="Export to Excel" style="min-width: 40px;">
                 <i class="fas fa-file-excel"></i>
@@ -669,8 +675,321 @@
 }
 </style>
 
+<style>
+    .bulk-table { width: 100%; border-collapse: collapse; }
+        .bulk-table th, .bulk-table td { border: 1px solid #dee2e6; padding: 3px; font-size: 12px; }
+        .bulk-table th { background: #e7f1ff; text-align: center; }
+        .bulk-table tr.bulk-err { background: #f8d7da; }
+        .bulk-table .bulk-no { text-align: center; width: 40px; font-weight: 600; }
+    #bulkCommonFields:disabled input, #bulkCommonFields:disabled select { background: #e9ecef; }
+</style>
+
+<!-- Bulk Card Registration Modal -->
+<div class="modal fade" id="bulkCardModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title"><i class="fas fa-layer-group"></i> Bulk Card Registration</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+
+                <h6 class="text-primary">Step 1: Common details (lock them once)</h6>
+                <fieldset id="bulkCommonFields">
+                    <div class="row g-2 mb-2">
+                        <div class="col-md-3">
+                            <label class="form-label">Sub Company *</label>
+                            <select id="bulkSubCo" class="form-control form-control-sm" onchange="bulkSubCoChange()">
+                                <option value="">--Select--</option>
+                                @if (ViewBag.SubCompanies is SelectList bulkSubCos)
+                                {
+                                    foreach (var bsc in bulkSubCos)
+                                    {
+                                        <option value="@bsc.Value">@bsc.Text</option>
+                                    }
+                                }
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Parent Company</label>
+                            <input id="bulkCompanyName" class="form-control form-control-sm bg-light" readonly />
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Card Type</label>
+                            <input id="bulkCardType" class="form-control form-control-sm bg-light" readonly />
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Status *</label>
+                            <select id="bulkStatus" class="form-control form-control-sm">
+                                <option value="">--Select--</option>
+                                <option value="1">Active</option>
+                                <option value="0">Inactive</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Expiry</label>
+                            <input id="bulkExpiry" type="date" class="form-control form-control-sm" />
+                        </div>
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-md-2">
+                            <label class="form-label">Fee Sch</label>
+                            <input id="bulkFee" class="form-control form-control-sm" />
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">App Form</label>
+                            <input id="bulkApp" class="form-control form-control-sm" />
+                        </div>
+                        <div class="col-md-8">
+                            <label class="form-label">Access Rights (Zones)</label>
+                            <div class="d-flex flex-wrap gap-2">
+                                @for (int bz = 0; bz < zones.Count; bz++)
+                                {
+                                    string bulkZoneName = zones[bz].zone_name;
+                                    <div class="form-check">
+                                        <input class="form-check-input bulk-zone" type="checkbox" value="@bulkZoneName" id="@("bulkzone_" + bz)" />
+                                        <label class="form-check-label small" for="@("bulkzone_" + bz)">@bulkZoneName</label>
+                                    </div>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                </fieldset>
+                <button type="button" id="bulkLockBtn" class="btn btn-warning btn-sm mb-3" onclick="bulkToggleLock()">
+                    <i class="fas fa-lock"></i> Lock Details
+                </button>
+
+                <hr />
+                <h6 class="text-primary">Step 2: Enter the cards (tip: paste rows copied from Excel into any cell)</h6>
+                <fieldset id="bulkGridFields" disabled>
+                    <table class="bulk-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Card No *</th>
+                                <th>Card Name</th>
+                                <th>Card Holder</th>
+                                <th>Owner Contact</th>
+                                <th>LPR No</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="bulkTbody"></tbody>
+                    </table>
+                    <div class="mt-2 d-flex gap-2">
+                        <button type="button" class="btn btn-outline-primary btn-sm" onclick="bulkAddRows(1)">+ Add Row</button>
+                        <button type="button" class="btn btn-outline-primary btn-sm" onclick="bulkAddRows(10)">+ Add 10 Rows</button>
+                    </div>
+                </fieldset>
+
+                <div id="bulkMessage" class="alert alert-danger mt-3" style="display:none; font-size:13px;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" id="bulkSaveBtn" class="btn btn-success btn-sm" onclick="bulkSave()">
+                    <i class="fas fa-save"></i> Save All Cards
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
     var isEditMode = @(Model.id > 0 ? "true" : "false");
+
+    // ===== BULK CARD REGISTRATION =====
+    var bulkLocked = false;
+
+    function bulkRowHtml() {
+        return '<td class="bulk-no"></td>' +
+            '<td><input class="form-control form-control-sm bulk-in bulk-cardno" /></td>' +
+            '<td><input class="form-control form-control-sm bulk-in bulk-cardname" /></td>' +
+            '<td><input class="form-control form-control-sm bulk-in bulk-holder" /></td>' +
+            '<td><input class="form-control form-control-sm bulk-in bulk-contact" /></td>' +
+            '<td><input class="form-control form-control-sm bulk-in bulk-plate" /></td>' +
+            '<td style="text-align:center;"><button type="button" class="btn btn-danger btn-sm" onclick="bulkRemoveRow(this)">&times;</button></td>';
+    }
+
+    function bulkRenumber() {
+        document.querySelectorAll('#bulkTbody tr').forEach(function (tr, i) {
+            tr.querySelector('.bulk-no').textContent = i + 1;
+        });
+    }
+
+    function bulkAddRows(n) {
+        var tbody = document.getElementById('bulkTbody');
+        for (var i = 0; i < n; i++) {
+            var tr = document.createElement('tr');
+            tr.innerHTML = bulkRowHtml();
+            tbody.appendChild(tr);
+        }
+        bulkRenumber();
+    }
+
+    function bulkRemoveRow(btn) {
+        var tr = btn.closest('tr');
+        if (tr) tr.remove();
+        if (document.querySelectorAll('#bulkTbody tr').length === 0) bulkAddRows(1);
+        bulkRenumber();
+    }
+
+    function bulkClearErrors() {
+        document.querySelectorAll('#bulkTbody tr').forEach(function (tr) {
+            tr.classList.remove('bulk-err');
+            tr.removeAttribute('title');
+        });
+        var box = document.getElementById('bulkMessage');
+        box.style.display = 'none';
+        box.textContent = '';
+    }
+
+    function bulkSetLock(lock) {
+        bulkLocked = lock;
+        document.getElementById('bulkCommonFields').disabled = lock;
+        document.getElementById('bulkGridFields').disabled = !lock;
+        document.getElementById('bulkLockBtn').innerHTML = lock
+            ? '<i class="fas fa-unlock"></i> Unlock Details'
+            : '<i class="fas fa-lock"></i> Lock Details';
+    }
+
+    function bulkToggleLock() {
+        if (bulkLocked) { bulkSetLock(false); return; }
+
+        if (!document.getElementById('bulkSubCo').value) { alert('Please select a Sub Company.'); return; }
+        if (!document.getElementById('bulkStatus').value) { alert('Please select a Status.'); return; }
+        bulkSetLock(true);
+    }
+
+    function openBulkModal() {
+        bulkSetLock(false);
+        ['bulkSubCo', 'bulkCompanyName', 'bulkCardType', 'bulkStatus', 'bulkExpiry', 'bulkFee', 'bulkApp'].forEach(function (id) {
+            document.getElementById(id).value = '';
+        });
+        document.querySelectorAll('.bulk-zone').forEach(function (cb) { cb.checked = false; });
+        document.getElementById('bulkTbody').innerHTML = '';
+        bulkAddRows(5);
+        bulkClearErrors();
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('bulkCardModal')).show();
+    }
+
+    function bulkSubCoChange() {
+        var id = document.getElementById('bulkSubCo').value;
+        document.getElementById('bulkCompanyName').value = '';
+        document.getElementById('bulkCardType').value = '';
+        if (!id) return;
+
+        fetch('/UserManagement/GetSubCompanyDetails?subCoId=' + encodeURIComponent(id))
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.success) {
+                    document.getElementById('bulkCompanyName').value = data.company_name || '';
+                    var ct = data.card_type || '';
+                    document.getElementById('bulkCardType').value = remarkToCardTypeMapping[ct] || ct;
+                }
+            })
+            .catch(function () { });
+    }
+
+    // Paste rows copied from Excel (tab separated) into the grid
+    document.getElementById('bulkTbody').addEventListener('paste', function (e) {
+        var target = e.target;
+        if (!target || !target.classList || !target.classList.contains('bulk-in')) return;
+
+        var text = (e.clipboardData || window.clipboardData).getData('text');
+        if (!text || (text.indexOf('\n') < 0 && text.indexOf('\t') < 0)) return;
+        e.preventDefault();
+
+        var cols = ['bulk-cardno', 'bulk-cardname', 'bulk-holder', 'bulk-contact', 'bulk-plate'];
+        var startCol = 0;
+        cols.forEach(function (c, i) { if (target.classList.contains(c)) startCol = i; });
+
+        var lines = text.replace(/\r/g, '').split('\n');
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+
+        var tbody = document.getElementById('bulkTbody');
+        var tr = target.closest('tr');
+
+        lines.forEach(function (line) {
+            if (!tr) { bulkAddRows(1); tr = tbody.lastElementChild; }
+            line.split('\t').forEach(function (val, ci) {
+                var col = startCol + ci;
+                if (col < cols.length) tr.querySelector('.' + cols[col]).value = val.trim();
+            });
+            tr = tr.nextElementSibling;
+        });
+    });
+
+    async function bulkSave() {
+        if (!bulkLocked) { alert('Please lock the common details first.'); return; }
+
+        bulkClearErrors();
+
+        var rows = [];
+        document.querySelectorAll('#bulkTbody tr').forEach(function (tr, i) {
+            var v = function (c) { return tr.querySelector(c).value.trim(); };
+            var row = {
+                RowNo: i + 1,
+                CardNo: v('.bulk-cardno'),
+                CardName: v('.bulk-cardname'),
+                OwnerName: v('.bulk-holder'),
+                OwnerContact: v('.bulk-contact'),
+                PlateNo: v('.bulk-plate')
+            };
+            if (row.CardNo || row.CardName || row.OwnerName || row.OwnerContact || row.PlateNo) rows.push(row);
+        });
+
+        if (rows.length === 0) { alert('Please enter at least one card.'); return; }
+
+        var payload = {
+            SubCoId: document.getElementById('bulkSubCo').value,
+            Status: document.getElementById('bulkStatus').value,
+            FeeScheduleId: document.getElementById('bulkFee').value.trim(),
+            ApplicationForm: document.getElementById('bulkApp').value.trim(),
+            ExpiryDate: document.getElementById('bulkExpiry').value,
+            Zones: Array.from(document.querySelectorAll('.bulk-zone:checked')).map(function (x) { return x.value; }),
+            Rows: rows
+        };
+
+        var saveBtn = document.getElementById('bulkSaveBtn');
+        saveBtn.disabled = true;
+
+        try {
+            var response = await fetch('/UserManagement/BulkAddCards', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var result = await response.json();
+
+            if (result.success) {
+                alert(result.message);
+                bootstrap.Modal.getOrCreateInstance(document.getElementById('bulkCardModal')).hide();
+                window.location.reload();
+                return;
+            }
+
+            var box = document.getElementById('bulkMessage');
+            var lines = [result.message || 'Save failed.'];
+            var trs = document.querySelectorAll('#bulkTbody tr');
+
+            (result.errors || []).forEach(function (er) {
+                lines.push('Row ' + er.row + ': ' + er.message);
+                var tr = trs[er.row - 1];
+                if (tr) {
+                    tr.classList.add('bulk-err');
+                    tr.title = (tr.title ? tr.title + ' | ' : '') + er.message;
+                }
+            });
+
+            box.textContent = lines.join('\n');
+            box.style.whiteSpace = 'pre-line';
+            box.style.display = 'block';
+        } catch (err) {
+            alert('Error: ' + err.message);
+        } finally {
+            saveBtn.disabled = false;
+        }
+    }
 
     var remarkToCardTypeMapping = {
         'FOC_PER_UNIT': 'SEASONAL',

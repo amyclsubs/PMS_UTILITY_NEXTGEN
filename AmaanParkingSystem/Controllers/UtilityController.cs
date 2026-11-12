@@ -326,6 +326,109 @@ public class UtilityController : BaseController
     }
 
     [HttpPost]
+    public IActionResult GetExitTrend([FromBody] ExitTrendRequest request)
+    {
+        try
+        {
+            if (request == null || request.StartDate == default || request.EndDate == default)
+                return Json(new { success = false, message = "Invalid date range" });
+
+            string view = (request.ViewBy ?? "daily").Trim().ToLowerInvariant();
+            string metric = (request.Metric ?? "count").Trim().ToLowerInvariant();
+
+            // Weeks start on Monday (1900-01-01 was a Monday), independent of DATEFIRST
+            string periodExpr =
+                view == "monthly" ? "DATEFROMPARTS(YEAR(e.exit_time), MONTH(e.exit_time), 1)" :
+                view == "weekly" ? "DATEADD(DAY, -(DATEDIFF(DAY, '19000101', CAST(e.exit_time AS DATE)) % 7), CAST(e.exit_time AS DATE))" :
+                                   "CAST(e.exit_time AS DATE)";
+
+            string valueExpr = metric == "revenue"
+                ? "ISNULL(SUM(CAST(e.paid_amount AS DECIMAL(18,2))), 0)"
+                : "CAST(COUNT(*) AS DECIMAL(18,2))";
+
+            var cardTypes = (request.CardTypes ?? new List<string>())
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Select(t => t.Trim())
+                .Distinct()
+                .ToList();
+
+            string cardTypeFilter = cardTypes.Count == 0
+                ? ""
+                : " AND ct.CardType IN (" + string.Join(",", cardTypes.Select((_, i) => "@ct" + i)) + ")";
+
+            string sql = @"
+                SELECT pr.PeriodStart, ct.CardType, /*VALUE*/ AS Val
+                FROM [AMAAN_PMS].[dbo].[db_tbl_15_car_exited] AS e WITH (NOLOCK)
+                CROSS APPLY (SELECT /*PERIOD*/ AS PeriodStart) pr
+                CROSS APPLY (SELECT CASE WHEN LTRIM(RTRIM(ISNULL(e.card_type, ''))) = '' 
+                                         THEN 'Unknown' 
+                                         ELSE LTRIM(RTRIM(e.card_type)) END AS CardType) ct
+                WHERE CAST(e.exit_time AS DATE) >= @StartDate
+                  AND CAST(e.exit_time AS DATE) <= @EndDate
+                  AND e.exit_time IS NOT NULL
+                  /*CARD_FILTER*/
+                GROUP BY pr.PeriodStart, ct.CardType
+                ORDER BY pr.PeriodStart";
+
+            sql = sql.Replace("/*VALUE*/", valueExpr)
+                     .Replace("/*PERIOD*/", periodExpr)
+                     .Replace("/*CARD_FILTER*/", cardTypeFilter);
+
+            var rows = new List<(DateTime Period, string CardType, decimal Value)>();
+
+            using (SqlConnection con = new SqlConnection(GetDynamicConnectionString()))
+            {
+                using (SqlCommand cmd = new SqlCommand(sql, con))
+                {
+                    cmd.CommandTimeout = 120;
+                    cmd.Parameters.AddWithValue("@StartDate", request.StartDate.Date);
+                    cmd.Parameters.AddWithValue("@EndDate", request.EndDate.Date);
+                    for (int i = 0; i < cardTypes.Count; i++)
+                        cmd.Parameters.Add("@ct" + i, SqlDbType.NVarChar, 100).Value = cardTypes[i];
+
+                    con.Open();
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            rows.Add((
+                                reader.GetDateTime(0),
+                                reader.GetString(1),
+                                reader.IsDBNull(2) ? 0m : reader.GetDecimal(2)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string labelFormat = view == "monthly" ? "MMM-yyyy" : "dd-MMM-yyyy";
+
+            var periods = rows.Select(r => r.Period).Distinct().OrderBy(p => p).ToList();
+            var labels = periods.Select(p => p.ToString(labelFormat, inv)).ToList();
+
+            var series = rows
+                .GroupBy(r => r.CardType)
+                .OrderBy(g => g.Key)
+                .Select(g => new
+                {
+                    name = g.Key,
+                    values = periods.Select(p => g.Where(x => x.Period == p).Sum(x => x.Value)).ToList()
+                })
+                .ToList();
+
+            var total = periods.Select(p => rows.Where(r => r.Period == p).Sum(r => r.Value)).ToList();
+
+            return Json(new { success = true, data = new { labels, series, total } });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in GetExitTrend");
+            return Json(new { success = false, message = $"Error: {ex.Message}" });
+        }
+    }
+
+    [HttpPost]
     public IActionResult GetPaymentMethodDistribution([FromBody] DateRangeRequest request)
     {
         try
@@ -533,6 +636,16 @@ public class DateRangeRequest
     public DateTime EndDate { get; set; }
     public string? CardType { get; set; }
     public List<string>? CardTypes { get; set; }
+}
+
+/// <summary>Request object for the exit trend chart</summary>
+public class ExitTrendRequest
+{
+    public DateTime StartDate { get; set; }
+    public DateTime EndDate { get; set; }
+    public List<string>? CardTypes { get; set; }
+    public string? ViewBy { get; set; }   // daily | weekly | monthly
+    public string? Metric { get; set; }   // count | revenue
 }
 
 /// <summary>Day-wise exit data model</summary>

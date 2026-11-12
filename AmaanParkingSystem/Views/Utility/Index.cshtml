@@ -841,6 +841,37 @@
             grid-template-columns: 1fr;
         }
     }
+    .chart-title { flex-wrap: wrap; }
+
+    .exit-trend-controls {
+        order: 3;
+        flex-basis: 100%;
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 14px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #2c3e50;
+    }
+
+        .exit-trend-controls label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .exit-trend-controls select {
+            height: 30px;
+            border: 2px solid #e3e7ef;
+            border-radius: 8px;
+            padding: 0 8px;
+            font-size: 12px;
+            background: #fff;
+            color: #2c3e50;
+        }
 </style>
 
 <!-- Error Banner -->
@@ -891,8 +922,25 @@
         <div class="charts-section">
             <div class="chart-card">
                 <h3 class="chart-title">
-                    <i class="fas fa-chart-line"></i> Daily Vehicle Exits Trend
-                    <div id="exitCardTypeBox" style="margin-left:auto;position:relative;">
+                    <i class="fas fa-chart-line"></i> Vehicle Exits Trend
+                    <div class="exit-trend-controls">
+                        <label>View
+                            <select id="exitViewBy" onchange="reloadExitTrend()">
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                                <option value="monthly">Monthly</option>
+                            </select>
+                        </label>
+                        <label>Metric
+                            <select id="exitMetric" onchange="reloadExitTrend()">
+                                <option value="count">Vehicles</option>
+                                <option value="revenue">Revenue (KES)</option>
+                            </select>
+                        </label>
+                        <label><input type="checkbox" id="exitShowTotal" checked onchange="rerenderExitTrend()" /> Total line</label>
+                        <label><input type="checkbox" id="exitShowLabels" onchange="rerenderExitTrend()" /> Data labels</label>
+                    </div>
+                    <div id="exitCardTypeBox" style="margin-left:auto;position:relative;order:2;">
                         <button type="button" id="exitCardTypeBtn" onclick="toggleExitCardTypeMenu(event)"
                                 style="height:34px;padding:0 12px;border:2px solid #e3e7ef;border-radius:8px;font-size:12px;font-weight:600;color:#2c3e50;background:#fff;cursor:pointer;">
                             All Card Types &#9662;
@@ -1320,22 +1368,147 @@
                 await loadExitCardTypes();
                 const cardTypes = getExitSelectedTypes();
 
-                const response = await fetch('/Utility/GetDayWiseExitData', {
+                const response = await fetch('/Utility/GetExitTrend', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ StartDate: dateFrom, EndDate: dateTo, CardTypes: cardTypes })
+                    body: JSON.stringify({
+                        StartDate: dateFrom,
+                        EndDate: dateTo,
+                        CardTypes: cardTypes,
+                        ViewBy: document.getElementById('exitViewBy')?.value || 'daily',
+                        Metric: document.getElementById('exitMetric')?.value || 'count'
+                    })
                 });
 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
                 const result = await response.json();
-                if (result.success) renderDailyExitsChart(result.data);
+                if (result.success) {
+                    exitTrendData = result.data;
+                    renderDailyExitsChart(exitTrendData);
+                }
             } catch (error) {
                 showError('Exits error: ' + error.message);
             }
         }
 
+        let exitTrendData = null;
+
+        function rerenderExitTrend() {
+            if (exitTrendData) renderDailyExitsChart(exitTrendData);
+        }
+
+        function formatExitValue(v) {
+            v = Number(v || 0);
+            return Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + ' K' : v.toFixed(0);
+        }
+
+        // Small built-in plugin that writes the value above each point (no external library)
+        const exitValueLabelsPlugin = {
+            id: 'exitValueLabels',
+            afterDatasetsDraw(chart) {
+                const opts = (chart.options.plugins && chart.options.plugins.exitValueLabels) || {};
+                if (!opts.display) return;
+
+                const c = chart.ctx;
+                c.save();
+                c.font = '600 10px sans-serif';
+                c.textAlign = 'center';
+                c.textBaseline = 'bottom';
+
+                chart.data.datasets.forEach((ds, di) => {
+                    if (!chart.isDatasetVisible(di)) return;
+                    const meta = chart.getDatasetMeta(di);
+                    c.fillStyle = ds.borderColor;
+                    meta.data.forEach((pt, i) => {
+                        const v = ds.data[i];
+                        if (!v) return;
+                        c.fillText(formatExitValue(v), pt.x, pt.y - 6);
+                    });
+                });
+
+                c.restore();
+            }
+        };
+
         function renderDailyExitsChart(data) {
+            const ctx = document.getElementById('dailyExitsChart');
+            if (!ctx) return;
+
+            if (dailyExitsChart) dailyExitsChart.destroy();
+
+            data = data || { labels: [], series: [], total: [] };
+
+            const showTotal = document.getElementById('exitShowTotal')?.checked !== false;
+            const showLabels = !!document.getElementById('exitShowLabels')?.checked;
+            const isRevenue = (document.getElementById('exitMetric')?.value || 'count') === 'revenue';
+            const palette = ['#1784fa', '#1ab677', '#9aa5b1', '#764ba2', '#ff6b6b', '#20c5d6', '#e67e22', '#667eea'];
+
+            const datasets = (data.series || []).map((s, i) => ({
+                label: s.name,
+                data: s.values,
+                borderColor: palette[i % palette.length],
+                backgroundColor: palette[i % palette.length],
+                borderWidth: 2.5,
+                fill: false,
+                tension: 0.3,
+                pointRadius: 4,
+                pointBorderColor: '#fff',
+                pointBorderWidth: 1.5
+            }));
+
+            if (showTotal) {
+                datasets.push({
+                    label: 'Total',
+                    data: data.total,
+                    borderColor: '#f5b301',
+                    backgroundColor: '#f5b301',
+                    borderWidth: 3,
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 4,
+                    pointBorderColor: '#fff',
+                    pointBorderWidth: 1.5
+                });
+            }
+
+            dailyExitsChart = new Chart(ctx.getContext('2d'), {
+                type: 'line',
+                data: { labels: data.labels || [], datasets: datasets },
+                plugins: [exitValueLabelsPlugin],
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    layout: { padding: { top: showLabels ? 16 : 0 } },
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { display: true, position: 'bottom', labels: { usePointStyle: true, padding: 14 } },
+                        tooltip: {
+                            callbacks: {
+                                label: function (c) {
+                                    const val = Number(c.parsed.y || 0);
+                                    return c.dataset.label + ': ' + (isRevenue ? 'KES ' : '') + val.toLocaleString();
+                                }
+                            }
+                        },
+                        exitValueLabels: { display: showLabels }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function (v) {
+                                    return Math.abs(v) >= 1000 ? parseFloat((v / 1000).toFixed(2)) + ' K' : v;
+                                }
+                            }
+                        },
+                        x: { grid: { display: false } }
+                    }
+                }
+            });
+        }
+
+        function renderDailyExitsChartLegacy(data) {
             const ctx = document.getElementById('dailyExitsChart');
             if (!ctx) return;
 
